@@ -8,7 +8,21 @@ them across workers.
 
 1. **AST diff, not text diff.** `astdiff.py` walks the old and new syntax trees
    together and reports the smallest subtrees that differ. Comments and
-   formatting change nothing, so they select nothing.
+   formatting change nothing, so they select nothing. Three other edits are
+   proved to change nothing before they are dropped:
+   - *Renamed locals.* A function whose only difference is a consistent,
+     one-to-one renaming of its local variables counts as unchanged only if
+     scope analysis shows every renamed name is a non-parameter local of
+     that function, nothing in it can see its frame (`locals`, `eval`,
+     `vars`, ...), and both versions compile to identical bytecode apart
+     from the names.
+   - *Reordered imports.* A contiguous run of plain stdlib or third-party
+     imports, each binding a different name, may be permuted. Imports of
+     sqlglot or the tests, relative, star and `__future__` imports, never
+     count as reordered.
+   - *Moved definitions.* Undecorated functions with constant defaults and no
+     annotations may swap places within a run of such definitions between
+     identical statements, in a module or class body.
 2. **Runtime changes → line coverage.** A difference inside a function or
    lambda body only matters to tests that execute it. `tracer.py` ran every
    test of the pinned commit in its own forked process with `sys.monitoring`
@@ -47,7 +61,10 @@ them across workers.
 7. **Verify cheap candidates.** Candidates that cost little to run are run on
    a symlink copy of the patched tree in a forked child, and kept only if they
    fail. Expensive ones are kept unverified when that is cheaper. The cost
-   model uses each test's measured CPU and its class setup.
+   model uses each test's measured CPU and its class setup. Every verified
+   test runs under its own timer (three times its measured cost plus a
+   margin; 15 s for class setup); a test that runs out of time is kept,
+   because a patch that makes a test hang makes it fail.
 8. **Pack.** The final set goes onto 1–8 workers (longest first), choosing
    the worker count that minimises busiest-worker time + 2 s per worker.
 
