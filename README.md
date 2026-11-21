@@ -99,6 +99,18 @@ them across workers.
    of that field or those other lines, plus the test files that name the
    setting. Both this set and the class-read set cover the change, so the
    cheaper of the two is used.
+   New default values get a closer look as well. Python evaluates a def's
+   defaults once, at import time, so a changed default changes the function
+   object that the fingerprint sees. Take an undecorated def whose header
+   differs only in the values of literal defaults (same parameters, kinds,
+   annotations and return). Its new value can be seen only by a call that
+   leaves that argument out, and such a call runs the function's body.
+   Nothing in sqlglot or its tests reads `__defaults__` or a signature's
+   defaults: `inspect` is used there for parameter names only. So the
+   function, as a class attribute or a module global, is charged to the
+   tests that ran its body (coverage) and to those that read the attribute
+   through its class family. This does not apply in folders whose listing
+   test reads code objects.
 4. **Operator swaps → value profile.** When the only difference in a
    comparison is its operator (`is` for `==`, `<` for `<=`, `is not` for `!=`,
    ...), executing the line is not enough to change anything: the new

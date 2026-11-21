@@ -33,6 +33,9 @@ class PyChange:
     other_import: bool = False
     import_lines: set = field(default_factory=set)  # old lines of import-time diffs
     def_changes: list = field(default_factory=list)  # (qualname, old_first, old_last) of defs whose header changed
+    # qualnames (among def_changes) of undecorated defs whose headers differ
+    # only in the values of constant defaults
+    default_defs: set = field(default_factory=set)
     toplevel_names: set = field(default_factory=set)  # names bound by changed module/class level statements
     class_quals: set = field(default_factory=set)  # qualnames of classes whose bodies changed at import level
     # one entry per runtime difference: (old lines, first line of enclosing function, its last line)
@@ -216,6 +219,8 @@ class _Walker:
                     return  # the same code with its local variables renamed
                 if not hdr_same:
                     self.report_def(a, ctx)
+                    if _defaults_only(a, b):
+                        self.c.default_defs.add(_qual(ctx, a.name))
                 body_a = a.body if isinstance(a.body, list) else [a.body]
                 body_b = b.body if isinstance(b.body, list) else [b.body]
                 self.seq(body_a, body_b, ctx + (a,), stmt, a)
@@ -775,6 +780,44 @@ def _strip_annotations(tree, defs: bool) -> None:
 
 def _noop(x) -> bool:
     return isinstance(x, ast.Expr) and isinstance(x.value, ast.Constant)
+
+
+def _literal(x) -> bool:
+    """A constant, or a signed number literal: evaluating it does nothing else."""
+    if isinstance(x, ast.UnaryOp) and isinstance(x.op, (ast.USub, ast.UAdd)):
+        x = x.operand
+        return isinstance(x, ast.Constant) and type(x.value) in (int, float, complex)
+    return isinstance(x, ast.Constant)
+
+
+def _defaults_only(a, b) -> bool:
+    """Two undecorated defs whose headers differ only in the values of
+    constant defaults (same parameters, kinds, annotations and return)."""
+    if not isinstance(a, (ast.FunctionDef, ast.AsyncFunctionDef)) or type(a) is not type(b):
+        return False
+    if a.decorator_list or b.decorator_list:
+        return False
+    for f in ("returns", "name", "type_params"):
+        if _dump_any(getattr(a, f, None)) != _dump_any(getattr(b, f, None)):
+            return False
+    aa, ba = a.args, b.args
+    if len(aa.defaults) != len(ba.defaults) or len(aa.kw_defaults) != len(ba.kw_defaults):
+        return False
+    for x, y in zip(list(aa.defaults) + list(aa.kw_defaults), list(ba.defaults) + list(ba.kw_defaults)):
+        if (x is None) != (y is None):
+            return False
+        if x is None or (_literal(x) and _literal(y)):
+            continue
+        if _dump(x) != _dump(y):
+            return False
+
+    def rest(args):
+        c = copy.copy(args)
+        c.defaults = []
+        c.kw_defaults = []
+        return _dump(c)
+
+    return rest(aa) == rest(ba)
 
 
 def _dump_any(x) -> str:

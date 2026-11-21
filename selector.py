@@ -1303,9 +1303,27 @@ def snapshot_candidates(pristine: dict, patched: dict, diff: dict, plan: Plan) -
 
     live = None
     flows: list = []
+    dd = default_defs(plan)
     for key, attr in diff["attrs"]:
         if attr == "__doc__":
             continue  # docstrings: nothing reads them at runtime
+        if dd:
+            if live is None:
+                import fingerprint
+
+                live = dict(fingerprint.iter_classes(sorted(sys.modules), "sqlglot"))
+            c = live.get(key)
+            if c is not None and default_only_value(c.__dict__.get(attr), dd):
+                # a method whose header changed only in constant defaults:
+                # only a call can see that, every call runs its body (the
+                # parent charged those tests from coverage), and nothing reads
+                # defaults by introspection; readers through the class family
+                # are added all the same
+                sub = subtree(key)
+                for x in LK_BY_ATTR.get(attr, ()):
+                    if x in sub:
+                        out.update(SETS[LK[f"{x}|{attr}"]])
+                continue
         if fresh_member(key, attr, plan, pristine):
             continue  # a new member under a name nothing mentions
         t = dispatch_member_tests(key, attr, plan, pristine, subtree(key))
@@ -1345,6 +1363,8 @@ def snapshot_candidates(pristine: dict, patched: dict, diff: dict, plan: Plan) -
     for mod, name in diff["globals"]:
         if name == "__doc__":
             continue
+        if dd and mod in sys.modules and default_only_value(vars(sys.modules[mod]).get(name), dd):
+            continue  # a function (or a name bound to it) whose defaults alone changed: as above
         if mod == "sqlglot.expressions" and name == "EXPR_CLASSES" and expr_registry_grew(pristine, diff, plan):
             sid = MODATTR.get(f"{mod}|__dict__")
             if sid is not None:
@@ -1389,6 +1409,24 @@ def snapshot_candidates(pristine: dict, patched: dict, diff: dict, plan: Plan) -
             if not hit:
                 out |= family_tests(key, sub)
     return out, False
+
+
+def default_defs(plan) -> set:
+    """(module, qualname) of the undecorated sqlglot defs whose headers changed
+    only in the values of constant defaults (astdiff), outside folders whose
+    tests read code objects."""
+    out = set()
+    for rel, ch in plan.py_changes.items():
+        if rel.startswith("sqlglot/") and rel.endswith(".py") and not introspected(rel):
+            for q in getattr(ch, "default_defs", None) or ():
+                out.add((module_of(rel), q))
+    return out
+
+
+def default_only_value(v, dd: set) -> bool:
+    import types
+
+    return isinstance(v, types.FunctionType) and (getattr(v, "__module__", None), getattr(v, "__qualname__", None)) in dd
 
 
 _LIVE: dict = {}
