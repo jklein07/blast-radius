@@ -34,6 +34,11 @@ MODATTR = os.environ.get("TRACE_MODATTR") == "1"
 # record which elements tests probe (`x in cls.ATTR`) of set-valued class attributes, nothing else
 SETKEYS = os.environ.get("TRACE_SETKEYS") == "1"
 LIGHT = CALIB or MODATTR or SETKEYS
+# start every test with the dialect registry emptied: the state a test meets
+# when it runs after tests/test_dialect_entry_points.py in the same process
+# (its setUp and tearDown clear Dialect._classes), so later lookups go
+# through _try_load
+CLEARREG = os.environ.get("TRACE_CLEARREG") == "1"
 
 sys.path.insert(0, ROOT)
 sys.path.insert(1, os.path.dirname(os.path.abspath(__file__)))
@@ -635,6 +640,10 @@ def run_child(num: int) -> None:
             json.dump(rec, f)
         os.replace(tmp, os.path.join(OUT, f"{num}.json"))
         return
+    if CLEARREG:
+        from sqlglot.dialects.dialect import Dialect as _Dialect
+
+        _Dialect._classes.clear()
     mon.use_tool_id(TOOL, "brtrace")
     mon.register_callback(TOOL, mon.events.LINE, on_line)
     mon.register_callback(TOOL, mon.events.PY_START, on_start)

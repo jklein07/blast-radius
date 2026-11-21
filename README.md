@@ -83,7 +83,16 @@ them across workers.
    only `test_typing`, which also reads the source files it checks. `tracer.py` ran every
    test of the pinned commit in its own forked process with `sys.monitoring`
    and recorded the lines each one executed (process-pool work included; see
-   `inline.py`).
+   `inline.py`). A test run alone can miss one thing a full pytest run does:
+   `tests/test_dialect_entry_points.py` empties the dialect registry
+   (`Dialect._classes`) in `setUp` and `tearDown`, so any test pytest runs
+   after it in the same process looks its dialects up again through
+   `_try_load`. A second trace starts every test with the registry emptied
+   and keeps the lines tests run only then (`maps/regcov.json.gz`, all in
+   `dialects/dialect.py`). A change to one of those lines keeps those tests
+   unverified, because a child runs each test from a full registry. (One
+   sample of this: narrowing the `except ImportError` in `_try_load` breaks
+   a generator test only when it runs after the entry-point tests.)
 3. **Import-time changes → measured state diff.** Class bodies, module
    constants, def headers and decorators act at import time, and sqlglot's
    metaclasses derive many structures from them (tries, inverse mappings,
@@ -231,6 +240,7 @@ references).
 | `wmtrace.py`, `build_wm.py` | Build-time: comparison-swap profile, `maps/wm.json.gz` |
 | `bwtrace.py`, `build_bw.py` | Build-time: and/or-swap profile, `maps/bw.json.gz` |
 | `build_core.py` | Build-time: the modules `import sqlglot` runs, `maps/core.json` |
+| `build_regcov.py` | Build-time: lines tests run only with the dialect registry emptied, `maps/regcov.json.gz` |
 | `qtrace.py`, `build_split.py` | Build-time: per-query coverage of the TPC tests, `maps/split.json.gz` |
 | `cftrace.py`, `build_cf.py`, `cfsel.py` | Per-pair coverage of the fixture-driven optimizer tests, `maps/cf.json.gz`; `cfsel.py` runs such a test on chosen pairs |
 
@@ -247,6 +257,8 @@ python build_wm.py tests.json out/wm out/calib maps/wm.json.gz
 PYTHONHASHSEED=0 python bwtrace.py /opt/sqlglot tests.json out/bw 8
 python build_bw.py tests.json out/bw out/calib maps/bw.json.gz
 python build_core.py /opt/sqlglot maps/core.json
+TRACE_CLEARREG=1 PYTHONHASHSEED=0 python tracer.py /opt/sqlglot tests.json out/trace_cr 6
+python build_regcov.py out/trace out/trace_cr maps/regcov.json.gz
 PYTHONHASHSEED=0 python qtrace.py /opt/sqlglot out/qtrace.json 4
 python build_split.py out/qtrace.json maps/split.json.gz
 PYTHONHASHSEED=0 python cftrace.py /opt/sqlglot out/cftrace 10

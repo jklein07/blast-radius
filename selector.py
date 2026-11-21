@@ -330,6 +330,35 @@ SPLIT_IDS = (
 )
 SPLIT_NUMS = {NUM_BY_ID[t]: t for t in SPLIT_IDS if t in NUM_BY_ID}
 _SPLIT = None
+_REG = None
+
+
+def reg_tests(rel: str, ch) -> set:
+    """Tests that run a changed line only when the dialect registry is empty.
+    tests/test_dialect_entry_points.py clears Dialect._classes in setUp and
+    tearDown, so a test pytest runs after it in the same process looks its
+    dialects up again through _try_load. maps/regcov.json.gz (tracer.py with
+    TRACE_CLEARREG=1, minus the plain trace) lists, per line, the tests that
+    run it only then. A child runs a test from a full registry, so these are
+    kept, not verified."""
+    global _REG
+    if _REG is None:
+        try:
+            with gzip.open(os.path.join(os.path.dirname(MAPS), "regcov.json.gz"), "rt") as fh:
+                _REG = json.load(fh)
+        except OSError:
+            _REG = {}
+    fm = _REG.get(rel)
+    if not fm:
+        return set()
+    lines = set(ch.runtime_lines)
+    spans = [(first, last) for _q, first, last in ch.def_changes]
+    out: set = set()
+    for ln, nums in fm.items():
+        li = int(ln)
+        if li in lines or any(first <= abs(li) <= last for first, last in spans):
+            out.update(nums)
+    return out
 
 
 def split_maps() -> dict:
@@ -1146,6 +1175,7 @@ def sqlglot_change(plan: Plan, rel: str, ch: astdiff.PyChange, old_src=None) -> 
             plan.need_snapshot = True
     for q, first, last in ch.def_changes:
         plan.cands.add(func_span_tests(rel, first, last), P_CODE, rt=True)
+    plan.cands.add(reg_tests(rel, ch), 1.0)  # kept unverified
     if ch.import_time:
         plan.need_snapshot = True
 
@@ -1165,6 +1195,7 @@ def test_change(plan: Plan, rel: str, ch: astdiff.PyChange, old_src=None) -> Non
         plan.cands.add(runtime_tests(rel, ch, old_src), P_TEST)
         for q, first, last in ch.def_changes:
             plan.cands.add(func_span_tests(rel, first, last), P_TEST)
+    plan.cands.add(reg_tests(rel, ch), 1.0)  # kept unverified
 
 
 # ---------------------------------------------------- snapshot-diff candidates
