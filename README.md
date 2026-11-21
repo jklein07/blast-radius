@@ -173,9 +173,9 @@ them across workers.
    child stops it once it holds 1.3 GB more than at the fork (address space
    is capped too, far above that), and that commit keeps every candidate, so
    two children never take the container past its memory limit.
-   Importing the patched code (all of sqlglot for the snapshot, the test
-   modules before verifying) has a CPU-time limit of 8 s, where a normal
-   import takes well under 2 s. Some modules parse SQL while they import,
+   Importing the patched code has a CPU-time limit: 5 s for sqlglot (the
+   snapshot; the slowest normal case takes 1.2 s) and 8 s for the test
+   modules before verifying. Some modules parse SQL while they import,
    so a patch that makes the parser loop forever hangs that import, and it
    hangs pytest's collection the same way: such a commit gets every test
    within seconds instead of holding a child until the parent kills it.

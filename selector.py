@@ -2272,7 +2272,8 @@ def _on_alarm(*_):
 # (a parser loop reached from a module-level parse) would otherwise hold the
 # child until the parent kills it. That patch makes pytest's collection hang
 # too, so the answer is every test.
-PREP_CPU = float(os.environ.get("BR_PREP_CPU", "8"))
+PREP_CPU = float(os.environ.get("BR_PREP_CPU", "8"))  # test modules
+SNAP_CPU = float(os.environ.get("BR_SNAP_CPU", "5"))  # sqlglot, for the snapshot (worst seen: 1.1 s)
 HUNG = [False]
 
 
@@ -2648,7 +2649,7 @@ def child_main(plan: Plan, wfd: int) -> None:
         if DEBUG:
             result["pre"] = pre
         _ph("farm")
-        _prep_limit(PREP_CPU)
+        _prep_limit(SNAP_CPU)
         os.chdir(root)
         sys.path.insert(0, root)
         os.environ["SKIP_INTEGRATION"] = "0"
