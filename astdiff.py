@@ -831,6 +831,167 @@ def _global_renames(a, b) -> list:
     return out
 
 
+# ------------------------------------------------------------ renamed methods
+# A private method renamed together with every call in its file changes
+# nothing observable when: both names are plain private names (not dunder or
+# sunder hooks, not *_sql, which the generator dispatches on by name, not the
+# namedtuple-style names other code duck-types on); every use is the def of
+# a method or an attribute load on self, cls or super(); every class that
+# defines it has only sqlglot bases (so no outside framework calls it by
+# name); and (the caller checks) no other file mentions either name.
+
+_DUCK_PRIVATE = {"_asdict", "_replace", "_make", "_fields", "_field_defaults", "_source"}
+_METHOD_DECOS = {"property", "staticmethod", "classmethod"}
+
+
+def _private_name(n: str) -> bool:
+    return (n.isidentifier() and n.startswith("_") and not n.startswith("__") and not n.endswith("_")
+            and not n.endswith("_sql") and n not in _DUCK_PRIVATE)
+
+
+def _internal_roots(tree) -> set:
+    """Names that refer to sqlglot code in this module: its classes and what
+    it imports from sqlglot (or relatively)."""
+    out = {"object"}
+    for x in ast.walk(tree):
+        if isinstance(x, ast.ClassDef):
+            out.add(x.name)
+        elif isinstance(x, ast.ImportFrom) and (x.level or (x.module or "").split(".")[0] == "sqlglot"):
+            out.update(a.asname or a.name for a in x.names)
+        elif isinstance(x, ast.Import):
+            for a in x.names:
+                if a.name.split(".")[0] == "sqlglot":
+                    out.add(a.asname or a.name.split(".")[0])
+    return out
+
+
+def _internal_class(c, roots: set) -> bool:
+    def ok(e):
+        if isinstance(e, ast.Subscript):  # t.Generic[E], Generic[...]
+            d = _dotted(e.value)
+            return d in ("t.Generic", "typing.Generic", "Generic")
+        d = _dotted(e)
+        return d is not None and d.split(".")[0] in roots
+    return all(ok(b) for b in c.bases) and all(k.arg == "metaclass" and ok(k.value) for k in c.keywords)
+
+
+def _method_defs(tree) -> dict:
+    """name -> [(class qualname, ordinal among that class's defs, def, class)]"""
+    out: dict = {}
+
+    def walk(body, qual):
+        for st in body:
+            if isinstance(st, ast.ClassDef):
+                q = qual + st.name
+                k = 0
+                for x in st.body:
+                    if isinstance(x, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                        out.setdefault(x.name, []).append((q, k, x, st))
+                        k += 1
+                walk(st.body, q + ".")
+            elif isinstance(st, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                walk(st.body, qual + st.name + ".<locals>.")
+            else:
+                for f in ("body", "orelse", "finalbody"):
+                    walk(getattr(st, f, None) or [], qual)
+                for h in getattr(st, "handlers", None) or ():
+                    walk(h.body, qual)
+
+    walk(tree.body, "")
+    return out
+
+
+def _method_uses_ok(tree, name: str, defs: list, roots: set) -> bool:
+    if not defs:
+        return False
+    def_ids = {id(d) for _, _, d, _ in defs}
+    for _, _, d, c in defs:
+        if any(not (isinstance(x, ast.Name) and x.id in _METHOD_DECOS) for x in d.decorator_list):
+            return False
+        if not _internal_class(c, roots):
+            return False
+    noop_consts = {id(p.value) for p in ast.walk(tree) if isinstance(p, ast.Expr) and isinstance(p.value, ast.Constant)}
+    for x in ast.walk(tree):
+        if isinstance(x, (ast.FunctionDef, ast.AsyncFunctionDef)) and x.name == name:
+            if id(x) not in def_ids:
+                return False
+            continue
+        if isinstance(x, ast.Attribute) and x.attr == name:
+            v = x.value
+            if not isinstance(x.ctx, ast.Load):
+                return False
+            if not ((isinstance(v, ast.Name) and v.id in ("self", "cls"))
+                    or (isinstance(v, ast.Call) and isinstance(v.func, ast.Name) and v.func.id == "super" and not v.args)):
+                return False
+            continue
+        if isinstance(x, ast.Constant):
+            if isinstance(x.value, str) and id(x) not in noop_consts and _word_in(x.value, name):
+                return False
+            continue
+        if isinstance(x, ast.Name) and x.id == name:
+            return False
+        for f in ("name", "arg", "asname", "rest"):
+            v = getattr(x, f, None)
+            if isinstance(v, str) and (v == name or (isinstance(x, ast.alias) and _word_in(v, name))):
+                return False
+        for f in ("names", "kwd_attrs"):
+            v = getattr(x, f, None)
+            if isinstance(v, list) and any(isinstance(y, str) and y == name for y in v):
+                return False
+    return True
+
+
+class _AttrRename(ast.NodeTransformer):
+    def __init__(self, old: str, new: str):
+        self.old, self.new = old, new
+
+    def visit_Attribute(self, n):
+        if n.attr == self.old:
+            n.attr = self.new
+        return self.generic_visit(n)
+
+    def visit_FunctionDef(self, n):
+        if n.name == self.old:
+            n.name = self.new
+        return self.generic_visit(n)
+
+    visit_AsyncFunctionDef = visit_FunctionDef
+
+
+def _method_renames(a, b) -> list:
+    """Pairs (old, new) of private methods renamed consistently in the file
+    (matched by class and position). Rewrites b to use the old names."""
+    ma, mb = _method_defs(a), _method_defs(b)
+    pos_b = {(q, k): n for n, ds in mb.items() for q, k, _, _ in ds}
+    pairs: dict = {}
+    for o, ds in ma.items():
+        if o in mb or not _private_name(o):
+            continue
+        for q, k, _, _ in ds:
+            n = pos_b.get((q, k))
+            if n is None or n in ma or not _private_name(n):
+                pairs[o] = None
+                break
+            if pairs.setdefault(o, n) != n:
+                pairs[o] = None
+                break
+    targets = [n for n in pairs.values() if n is not None]
+    ra, rb = _internal_roots(a), _internal_roots(b)
+    out = []
+    for o, n in pairs.items():
+        if n is None or targets.count(n) != 1:
+            continue
+        if len(ma[o]) != len(mb.get(n, ())):
+            continue
+        if not (_method_uses_ok(a, o, ma[o], ra) and _method_uses_ok(b, n, mb[n], rb)):
+            continue
+        if _mentioned(a, n) or _mentioned(b, o):
+            continue
+        _AttrRename(n, o).visit(b)
+        out.append((o, n))
+    return out
+
+
 def analyze(old_src: str | None, new_src: str | None, old_changed=None, new_changed=None, renames: bool = True) -> PyChange:
     """old_changed/new_changed are accepted for compatibility and unused.
     renames=False: no rename counts as no change (for code a test inspects:
@@ -874,7 +1035,7 @@ def analyze(old_src: str | None, new_src: str | None, old_changed=None, new_chan
     _strip_annotations(a, defs)
     _strip_annotations(b, defs)
     if renames:
-        c.global_renames = _global_renames(a, b)
+        c.global_renames = _global_renames(a, b) + _method_renames(a, b)
     skip = _permuted_imports(a.body, b.body)
     ba = [x for i, x in enumerate(a.body) if i not in skip]
     bb = [x for i, x in enumerate(b.body) if i not in skip]

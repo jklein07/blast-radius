@@ -32,6 +32,12 @@ them across workers.
      rule applies in a folder whose listing test reads code objects
      (`test_typing` compares the `sqlglot/typing` annotators by `co_names`
      and `co_varnames`).
+   - *Renamed private methods.* A method renamed together with every use in
+     its file is unchanged when both names are plain private names (not
+     dunder or `_sunder_` hooks, not `*_sql`, which the generator dispatches
+     on by name), every use is its def or an attribute load on `self`, `cls`
+     or `super()`, the classes that define it have only sqlglot bases, and
+     neither name appears in any other file.
    - *New modules nothing imports.* Python imports a module only by its name,
      and every dynamic import in sqlglot and its tests builds that name from
      text found somewhere (a dialect string, an attribute name, a fixed
