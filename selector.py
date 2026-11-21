@@ -376,7 +376,7 @@ def analyze(cid: str, text: str) -> Plan:
         rels = {r for r in (old_rel, new_rel) if r}
         if fp.is_binary:
             for r in rels:
-                plan.cands.add(tests_reading(r), P_DATA)
+                plan.cands.add(tests_reading(r, True), P_DATA)
             continue
         try:
             old = read_pristine(old_rel) if old_rel and not fp.is_new else None
@@ -398,6 +398,9 @@ def analyze(cid: str, text: str) -> Plan:
                 plan.all_tests = True
                 plan.notes.append(f"pytest config {r}")
         path = new_rel or old_rel
+        listing = fp.is_new or fp.is_deleted or (old_rel != new_rel)
+        for r in rels:  # tests that open the file itself (source readers too)
+            plan.cands.add(tests_reading(r, listing), P_CODE if r.endswith(".py") else P_DATA)
         if path.endswith(".py") and (path.startswith("sqlglot/") or path.startswith("tests/")):
             ch = astdiff.analyze(old, new)
             if old_rel != new_rel and old_rel and new_rel:
@@ -411,15 +414,14 @@ def analyze(cid: str, text: str) -> Plan:
             else:
                 test_change(plan, old_rel or path, ch)
         else:
-            # data file
+            # data file (already added above as a read file)
             for r in rels:
-                plan.cands.add(tests_reading(r), P_DATA)
                 if r.endswith(".py") and r.startswith("sqlglot/"):
                     plan.need_snapshot = True
     return plan
 
 
-def tests_reading(rel: str) -> set:
+def tests_reading(rel: str, listing: bool = False) -> set:
     out: set = set()
     sid = READS.get(rel)
     if sid is not None:
@@ -429,10 +431,11 @@ def tests_reading(rel: str) -> set:
             out |= set(BY_FILE.get(tf, []))
             for imp in TEST_IMPORTERS.get(tf, []):
                 out |= set(BY_FILE.get(imp, []))
-    d = os.path.dirname(rel)
-    sid = DIRREADS.get(d)
-    if sid is not None:
-        out.update(SETS[sid])
+    if listing:  # the set of files in a folder changes only on add/remove/rename
+        d = os.path.dirname(rel)
+        sid = DIRREADS.get(d)
+        if sid is not None:
+            out.update(SETS[sid])
     return out
 
 

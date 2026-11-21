@@ -34,6 +34,12 @@ class PyChange:
     class_quals: set = field(default_factory=set)  # qualnames of classes whose bodies changed at import level
 
 
+def _first(fn) -> int:
+    """co_firstlineno of a function: decorated defs start at their first decorator."""
+    decs = getattr(fn, "decorator_list", None) or []
+    return min([fn.lineno] + [d.lineno for d in decs])
+
+
 def _dump(n) -> str:
     return ast.dump(n, include_attributes=False)
 
@@ -131,7 +137,7 @@ class _Walker:
         if isinstance(n, FUNC) and fn is None and not insertion:
             # a whole def replaced/removed at class or module level
             self.report_def(n, ctx)
-            lines = {-n.lineno} | _stmt_lines(n)
+            lines = {-_first(n)} | _stmt_lines(n)
             self.c.runtime_lines |= lines
             self.c.import_time = True
             self._bind(n, ctx)
@@ -145,9 +151,9 @@ class _Walker:
                 if not isinstance(stmt, (ast.If, ast.For, ast.While, ast.With, ast.Try, ast.AsyncFor, ast.AsyncWith, ast.Match, ast.TryStar)):
                     lines |= _stmt_lines(stmt)
             if insertion or not lines:
-                lines.add(-fn.lineno)
+                lines.add(-_first(fn))
             if isinstance(n, FUNC) and n is not fn:
-                lines.add(-n.lineno)
+                lines.add(-_first(n))
             self.c.runtime_lines |= lines
             return
         # import-time difference
@@ -163,8 +169,8 @@ class _Walker:
             self.c.runtime_lines |= {fn.lineno, -fn.lineno}
             return
         q = _qual(ctx, fn.name)
-        self.c.def_changes.append((q, fn.lineno, fn.end_lineno))
-        self.c.runtime_lines.add(-fn.lineno)
+        self.c.def_changes.append((q, _first(fn), fn.end_lineno))
+        self.c.runtime_lines.add(-_first(fn))
         self.c.runtime_lines |= _stmt_lines(fn)
         self.c.import_time = True
         self.c.import_lines.add(fn.lineno)
@@ -220,6 +226,14 @@ def analyze(old_src: str | None, new_src: str | None) -> PyChange:
         c.semantic = True
         c.import_time = True
         return c
+    import re
+
+    cookie = re.compile(r"^[ \t\f]*#.*?coding[:=][ \t]*([-\w.]+)")
+    ha = [l for l in (old_src or "").splitlines()[:2] if cookie.match(l)]
+    hb = [l for l in (new_src or "").splitlines()[:2] if cookie.match(l)]
+    if ha != hb:
+        c.semantic = True
+        c.import_time = True
     if _dump(a) == _dump(b):
         # also compare the encoding-sensitive bits: the module docstring etc. are in the AST already
         return c
