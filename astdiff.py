@@ -982,6 +982,8 @@ def _method_renames(a, b) -> list:
                 pairs[o] = None
                 break
     targets = [n for n in pairs.values() if n is not None]
+    if not targets:
+        return []
     ra, rb = _internal_roots(a), _internal_roots(b)
     out = []
     for o, n in pairs.items():
