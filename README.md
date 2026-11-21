@@ -152,7 +152,9 @@ The main process guards itself the same way. A patch that keeps the analysis
 of one commit busy for 20 s gets every test for that commit. If anything in
 the main process raises, or the batch nears its time limit, every commit not
 yet printed still gets exactly one line: its selection so far, else every
-candidate, else every test.
+candidate, else every test. A process a test leaves running cannot stall it
+either: when a child exits, whatever it left in its process group is killed,
+and its answer is read without waiting on a pipe something else still holds.
 
 No answers are worked out ahead of time: there is no table from patches or
 kinds of edit to failing tests. The maps in `maps/` are built only from the
