@@ -226,6 +226,7 @@ def snapshot(root_pkg: str = "sqlglot", only: set | None = None) -> dict:
     mods, errors = import_all(root_pkg)
     classes: dict[str, dict[str, str]] = {}
     bases: dict[str, list[str]] = {}
+    alias: dict[str, str] = {}  # key -> module:qualname when they differ (dynamic classes)
     for key, c in iter_classes(sorted(sys.modules), root_pkg):
         if only is not None and key.partition(":")[0] not in only:
             continue
@@ -239,6 +240,9 @@ def snapshot(root_pkg: str = "sqlglot", only: set | None = None) -> dict:
             attrs[name] = fp(v)
         classes[key] = attrs
         bases[key] = [f"{b.__module__}:{b.__qualname__}" for b in c.__mro__[1:] if b is not object]
+        mq = f"{getattr(c, '__module__', '?')}:{getattr(c, '__qualname__', '?')}"
+        if mq != key:
+            alias[key] = mq
     globals_: dict[str, dict[str, str]] = {}
     for mname in sorted(sys.modules):
         if not (mname == root_pkg or mname.startswith(root_pkg + ".")):
@@ -252,7 +256,7 @@ def snapshot(root_pkg: str = "sqlglot", only: set | None = None) -> dict:
                 continue
             g[name] = fp(v)
         globals_[mname] = g
-    return {"classes": classes, "bases": bases, "globals": globals_, "errors": errors}
+    return {"classes": classes, "bases": bases, "globals": globals_, "errors": errors, "alias": alias}
 
 
 def diff(a: dict, b: dict, only: set | None = None) -> dict:

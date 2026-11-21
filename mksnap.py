@@ -2,6 +2,7 @@
 import json
 import os
 import sys
+import unittest  # noqa: F401  sqlglot turns on strict argument checks when unittest is loaded at import; tests always run that way
 
 root = sys.argv[1]
 sys.path.insert(0, root)

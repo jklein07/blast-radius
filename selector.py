@@ -30,6 +30,12 @@ import os
 import signal
 import sys
 import time
+import unittest  # noqa: F401
+
+# sqlglot decides at import time whether to run its strict argument checks
+# (UNITTEST = "unittest" in sys.modules or "pytest" in sys.modules). Tests
+# always run with them on, so every sqlglot import here must see unittest
+# loaded first, or a verification child would pass tests that really fail.
 
 APP = os.path.dirname(os.path.abspath(__file__))
 PRISTINE = os.environ.get("BR_SQLGLOT", "/opt/sqlglot")
@@ -820,6 +826,32 @@ def pristine_snapshot():
     return _SNAP
 
 
+def class_subtree(pristine: dict, patched: dict):
+    """k -> k and its subclasses, each under every name a trace may have used
+    for it: the snapshot key and module:qualname (they differ for classes a
+    metaclass builds on the fly, and base lists use module:qualname)."""
+    alias: dict = {}
+    for snap in (pristine, patched):
+        alias.update((snap or {}).get("alias") or {})
+    children: dict[str, set] = {}
+    for snap in (pristine, patched):
+        for k, mro in ((snap or {}).get("bases") or {}).items():
+            for b in mro:
+                children.setdefault(b, set()).add(k)
+
+    def subtree(k: str) -> set:
+        names = {k}
+        if k in alias:
+            names.add(alias[k])
+        out = set(names)
+        for nm in names:
+            out |= children.get(nm, set())
+        out |= {alias[x] for x in list(out) if x in alias}
+        return out
+
+    return subtree
+
+
 def snapshot_candidates(pristine: dict, patched: dict, diff: dict, plan: Plan) -> tuple[set, bool]:
     """Tests affected by changed import-time state. Returns (tests, everything)."""
     out: set = set()
@@ -827,15 +859,7 @@ def snapshot_candidates(pristine: dict, patched: dict, diff: dict, plan: Plan) -
         new_err = {m for m, _ in diff["errors"] if m in patched["errors"]}
         if new_err:
             return set(ALL), True
-    # subclass index over both versions
-    children: dict[str, set] = {}
-    for snap in (pristine, patched):
-        for k, mro in snap["bases"].items():
-            for b in mro:
-                children.setdefault(b, set()).add(k)
-
-    def subtree(k: str) -> set:
-        return {k} | children.get(k, set())
+    subtree = class_subtree(pristine, patched)
 
     for key, attr in diff["attrs"]:
         if attr == "__doc__":
@@ -858,7 +882,10 @@ def snapshot_candidates(pristine: dict, patched: dict, diff: dict, plan: Plan) -
         meth = method_lines(key, attr, pristine, patched)
         if meth is not None:
             out |= meth
-        elif not hit and (attr.startswith("__") or attr not in LK_BY_ATTR):
+        elif not hit and (attr.startswith("_") or attr not in LK_BY_ATTR):
+            # (private attributes are mostly derived caches a metaclass or a
+            # lazily built object reads before any test runs, so the trace may
+            # not have seen their readers)
             # reads the descriptors cannot record (dunders such as __slots__,
             # enum members, descriptors): every user of the class family
             out |= family_tests(key, sub)
@@ -1147,11 +1174,7 @@ def fe_import_ok(n: int, d: dict, plan, pristine=None, patched=None) -> bool:
         for k in fe["exec_lk"]:
             c, _, a = k.rpartition("|")
             lkby.setdefault(a, set()).add(c)
-    children: dict = {}
-    for snap in (pristine, patched):
-        for k, mro in ((snap or {}).get("bases") or {}).items():
-            for b in mro:
-                children.setdefault(b, set()).add(k)
+    subtree = class_subtree(pristine, patched)
 
     def runs_there(rel, span):
         return any(span[0] <= abs(l) <= span[1] for l in ex.get(rel, ()))
@@ -1171,7 +1194,7 @@ def fe_import_ok(n: int, d: dict, plan, pristine=None, patched=None) -> bool:
         if lkby is not None and pristine is not None:
             # which classes the execution side read this attribute through
             readers = lkby.get(attr, set())
-            if readers & ({key} | children.get(key, set())):
+            if readers & subtree(key):
                 return False
             if not readers and attr in xn:
                 return False  # named there but never read as a recorded class attribute
