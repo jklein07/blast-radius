@@ -1129,7 +1129,7 @@ def _def_span(rel: str, qual: str):
     return _DEFS[k]
 
 
-def fe_import_ok(n: int, d: dict, plan) -> bool:
+def fe_import_ok(n: int, d: dict, plan, pristine=None, patched=None) -> bool:
     """Can the fingerprint check also vouch for test n under this import-time
     diff? Only if nothing that changed is used by the test's execution side:
     changed functions never run there, changed values are never read there."""
@@ -1141,6 +1141,17 @@ def fe_import_ok(n: int, d: dict, plan) -> bool:
     ex = fe["_exec"]
     xa = set(fe.get("exec_attrs", ()))
     xn = set(fe.get("exec_names", ()))
+    lkby = fe.get("_lkby")
+    if lkby is None and "exec_lk" in fe:
+        lkby = fe["_lkby"] = {}
+        for k in fe["exec_lk"]:
+            c, _, a = k.rpartition("|")
+            lkby.setdefault(a, set()).add(c)
+    children: dict = {}
+    for snap in (pristine, patched):
+        for k, mro in ((snap or {}).get("bases") or {}).items():
+            for b in mro:
+                children.setdefault(b, set()).add(k)
 
     def runs_there(rel, span):
         return any(span[0] <= abs(l) <= span[1] for l in ex.get(rel, ()))
@@ -1156,6 +1167,14 @@ def fe_import_ok(n: int, d: dict, plan) -> bool:
         if span is not None:
             if runs_there(rel, span):
                 return False
+            continue
+        if lkby is not None and pristine is not None:
+            # which classes the execution side read this attribute through
+            readers = lkby.get(attr, set())
+            if readers & ({key} | children.get(key, set())):
+                return False
+            if not readers and attr in xn:
+                return False  # named there but never read as a recorded class attribute
             continue
         if attr in xa or attr in xn:
             return False
@@ -1230,7 +1249,7 @@ def child_main(plan: Plan, wfd: int) -> None:
                         continue
                     if n in plan.cands and (plan.split.get(n) or (None,) * 5)[4] != "fe":
                         continue
-                    if not fe_import_ok(n, d, plan):
+                    if not fe_import_ok(n, d, plan, pristine, patched):
                         continue
                     sm = split_maps().get("tests", {}).get(SPLIT_NUMS[n])
                     fe = fe_maps().get(SPLIT_NUMS[n])

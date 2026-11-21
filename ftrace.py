@@ -73,7 +73,9 @@ def exec_lines(tid):
     lines: dict = {}
     depth = [0]
     attrs: set = set()
+    lk: set = set()
     live = [False]
+    keys: dict = {}
 
     class _TA:  # records reads of a wrapped class attribute while the execution side runs
         __slots__ = ("v", "k")
@@ -85,9 +87,12 @@ def exec_lines(tid):
         def __get__(self, obj, typ=None):
             if live[0] and depth[0] == 0:
                 attrs.add(self.k)
+                t = typ if typ is not None else type(obj)
+                lk.add((keys.get(id(t)) or f"{getattr(t, '__module__', '?')}:{getattr(t, '__qualname__', '?')}") + "|" + self.k)
             return self.v
 
     for _key, c in fingerprint.iter_classes(sorted(sys.modules), "sqlglot"):
+        keys[id(c)] = _key
         if isinstance(c, enum.EnumMeta):
             continue
         for name, v in list(c.__dict__.items()):
@@ -167,7 +172,7 @@ def exec_lines(tid):
             except (tokenize.TokenError, IndentationError, SyntaxError):
                 names.update(__import__("re").findall(r"[A-Za-z_][A-Za-z0-9_]*", src[ln - 1]))
     return {"failed": bool(res.failures or res.errors), "lines": {f: sorted(v) for f, v in lines.items()},
-            "attrs": sorted(attrs), "names": sorted(names)}
+            "attrs": sorted(attrs), "names": sorted(names), "lk": sorted(lk)}
 
 
 def main():
@@ -198,7 +203,7 @@ def main():
         if e.get("failed") or "error" in e:
             raise SystemExit(f"{tid}: test run failed while tracing: {e.get('error')}")
         out[tid] = {"attr": attr, "nq": n, "arts": fresh, "unstable": unstable, "cpu": s["cpu"], "exec": e["lines"],
-                    "exec_attrs": e["attrs"], "exec_names": e["names"]}
+                    "exec_attrs": e["attrs"], "exec_names": e["names"], "exec_lk": e["lk"]}
         print(tid.split("::")[-1], "queries", n, "unstable", unstable, "exec lines", sum(len(v) for v in e["lines"].values()),
               "cpu", round(sum(s["cpu"].values()), 2), "exec attrs", len(e["attrs"]), "names", len(e["names"]), file=sys.stderr, flush=True)
     with open(OUT, "w") as fh:
