@@ -14,3 +14,8 @@ snap = fingerprint.snapshot("sqlglot")
 with open(sys.argv[2], "w") as f:
     json.dump(snap, f)
 print("classes", len(snap["classes"]), "errors", snap["errors"], file=sys.stderr)
+# entries of dict-valued class attributes, by key (selector: which keys a change touched)
+dk = fingerprint.dict_snapshot("sqlglot")
+with open(os.path.splitext(sys.argv[2])[0] + "dk.json", "w") as f:
+    json.dump(dk, f, separators=(",", ":"))
+print("dict attrs", len(dk), "entries", sum(len(v) for v in dk.values()), file=sys.stderr)

@@ -30,6 +30,8 @@ def sid(s) -> int:
     return i
 
 
+kl: dict[str, dict[str, set]] = {}  # "class|attr" -> dict key id -> tests that looked it up
+kla: dict[str, set] = {}  # "class|attr" -> tests that read the dict as a whole
 cov: dict[str, dict[int, set]] = {}
 lk: dict[str, set] = {}
 classuse: dict[str, set] = {}
@@ -59,6 +61,12 @@ for t in tests:
         classuse.setdefault(k.rpartition("|")[0], set()).add(li)
     for path in r["reads"]:
         reads.setdefault(path, set()).add(li)
+    for tag, kids in r.get("kl", {}).items():
+        d = kl.setdefault(tag, {})
+        for kid in kids:
+            d.setdefault(kid, set()).add(li)
+    for tag in r.get("kla", ()):
+        kla.setdefault(tag, set()).add(li)
 
 print("missing traces", missing, "failed under trace", [ids[i] for i in failed], "spawners", [ids[i] for i in spawners], file=sys.stderr)
 
@@ -295,6 +303,10 @@ maps = {
     "spawners": sorted(set(spawners)),
     "mod_imports": mod_imports,
     "vcpu": vcpu,
+    # dict-valued class attributes recorded by key (tracer.py _RD)
+    "kltags": json.load(open(os.path.join(trace_dir, "_kl_tags.json"))) if os.path.exists(os.path.join(trace_dir, "_kl_tags.json")) else [],
+    "kl": {tag: {kid: sid(s) for kid, s in d.items()} for tag, d in kl.items()},
+    "kla": {tag: sid(s) for tag, s in kla.items()},
 }
 os.makedirs(os.path.dirname(out) or ".", exist_ok=True)
 raw = json.dumps(maps, separators=(",", ":"))

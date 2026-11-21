@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import builtins
 import enum
+import gc
 import io
 import json
 import os
@@ -146,11 +147,142 @@ class _TA:
         return self.v
 
 
+# ------------------------------------------ dict-valued attributes, by key
+# A class attribute holding a plain dict is swapped for a _RD copy that
+# records which keys a test looks up (hits and misses alike). Anything that
+# depends on more than single keys (iteration, len, ==, copies, merges,
+# mutation, pickling) marks the whole dict as read. Overriding __iter__ also
+# keeps CPython's merge fast path ({**d}, dict(d), d2.update(d)) off it, so
+# those go through keys() and count as whole reads.
+_kl: dict = {}  # tag index -> keys looked up in this test
+_kla: set = set()  # tag indexes read as a whole in this test
+KL_TAGS: list = []
+_DBG = os.environ.get("TRACE_KL_DEBUG")
+_DBG_HITS: list = []  # tag index -> ["class key|attr", ...] (one dict can sit in several classes)
+
+
+class _Len:  # pseudo-key: the dict's size was read (len(), truth tests)
+    __slots__ = ()
+
+
+_LEN = _Len()
+
+
+def _klk(t, k):
+    s = _kl.get(t)
+    if s is None:
+        s = _kl[t] = set()
+    try:
+        s.add(k)
+    except TypeError:
+        if _DBG and t not in _kla:
+            import traceback
+            _DBG_HITS.append("UNHASHABLE " + repr(type(k)) + " " + str(KL_TAGS[t][:2]) + "\n" + "".join(traceback.format_stack(limit=7)[:-1]) + "\n")
+        _kla.add(t)
+
+
+class _RD(dict):
+    __slots__ = ("_t",)
+
+    def __getitem__(self, k):
+        if _active:
+            _klk(self._t, k)
+        return dict.__getitem__(self, k)
+
+    def get(self, k, d=None):
+        if _active:
+            _klk(self._t, k)
+        return dict.get(self, k, d)
+
+    def __contains__(self, k):
+        if _active:
+            _klk(self._t, k)
+        return dict.__contains__(self, k)
+
+    def __len__(self):  # also truth tests: depends only on the size
+        if _active:
+            _klk(self._t, _LEN)
+        return dict.__len__(self)
+
+    def __reduce_ex__(self, proto):
+        if _active:
+            if _DBG and self._t not in _kla:
+                import traceback
+                _DBG_HITS.append("REDUCE " + str(KL_TAGS[self._t][:2]) + "\n" + "".join(traceback.format_stack(limit=9)[:-1]) + "\n")
+            _kla.add(self._t)
+        return (dict, (dict.copy(self),))
+
+    __reduce__ = lambda self: self.__reduce_ex__(2)  # noqa: E731
+
+
+def _bulk(name):
+    base = getattr(dict, name)
+
+    def f(self, *a, **k):
+        if _active:
+            if _DBG and self._t not in _kla:
+                import traceback
+                _DBG_HITS.append("BULK " + name + " " + str(KL_TAGS[self._t][:2]) + "\n" + "".join(traceback.format_stack(limit=7)[:-1]) + "\n")
+            _kla.add(self._t)
+        return base(self, *a, **k)
+
+    f.__name__ = name
+    return f
+
+
+for _n in ("__iter__", "keys", "values", "items", "__repr__", "copy", "__eq__", "__ne__", "__or__",
+           "__ror__", "__ior__", "__reversed__", "setdefault", "pop", "popitem", "update", "__setitem__",
+           "__delitem__", "clear", "__sizeof__"):
+    setattr(_RD, _n, _bulk(_n))
+
+
+def _foreign_refs(v, owners_ns: list) -> bool:
+    """True when anything but the owning class namespaces refers to v: reads
+    through that reference would bypass the recording copy."""
+    import types as _types
+
+    vid = id(v)
+    for r in gc.get_referrers(v):
+        if isinstance(r, _types.FrameType) or r is _dict_owners:
+            continue
+        if isinstance(r, dict) and any(r is ns or (id(r.get(n)) == vid and r.keys() == ns.keys()) for ns, n in owners_ns):
+            continue
+        return True
+    return False
+
+
 wrapped = 0
 class_keys: dict[int, str] = {}
 # list first: wrapping replaces a class's nested classes (dialect Tokenizers ...)
 # in its __dict__, and a lazy walk would then never reach them
-for key, c in list(fingerprint.iter_classes(sorted(sys.modules), "sqlglot")):
+_all_classes = list(fingerprint.iter_classes(sorted(sys.modules), "sqlglot"))
+_dict_owners: dict = {}  # id(dict) -> [(class, key, attr)]
+_rd_for: dict = {}  # id(original dict) -> its _RD
+_keep: list = []
+
+
+def _build_rd() -> None:
+    # (a function, so no module-level variable holds a dict while referrers are checked)
+    for key, c in _all_classes:
+        if CALIB or isinstance(c, enum.EnumMeta):
+            continue
+        for name in list(c.__dict__):
+            if not (name.startswith("__") and name.endswith("__")) and type(c.__dict__[name]) is dict:
+                _dict_owners.setdefault(id(c.__dict__[name]), []).append((c, key, name))
+    gc.collect()
+    for vid, os_ in _dict_owners.items():
+        c0, _k0, n0 = os_[0]
+        if _foreign_refs(c0.__dict__[n0], [(c.__dict__, n) for c, _k, n in os_]):
+            continue
+        _keep.append(c0.__dict__[n0])  # keep the original alive: ids in _rd_for stay unique
+        rd = _RD(c0.__dict__[n0])
+        rd._t = len(KL_TAGS)
+        KL_TAGS.append(sorted({f"{k}|{n}" for _c, k, n in os_}))
+        _rd_for[vid] = rd
+
+
+_build_rd()
+for key, c in _all_classes:
     class_keys[id(c)] = key
     if CALIB or isinstance(c, enum.EnumMeta):
         continue
@@ -160,11 +292,45 @@ for key, c in list(fingerprint.iter_classes(sorted(sys.modules), "sqlglot")):
         if hasattr(type(v), "__get__") and not isinstance(v, type):
             continue
         try:
-            setattr(c, name, _TA(v, name))
+            setattr(c, name, _TA(_rd_for.get(id(v), v) if type(v) is dict else v, name))
             wrapped += 1
         except Exception:
             pass
-print(f"wrapped {wrapped} class attributes", file=sys.stderr)
+print(f"wrapped {wrapped} class attributes, {len(KL_TAGS)} dicts by key of {len(_dict_owners)}", file=sys.stderr)
+
+
+def _dispatch_by_key() -> None:
+    """Generator.__init__ builds (once per class, inside a test) a dispatch
+    table: a copy of cls.TRANSFORMS plus the class's *_sql methods. That copy
+    would read TRANSFORMS as a whole in every test that generates SQL. An
+    entry of the table differs between two versions only when TRANSFORMS
+    differs at that key, so lookups in the table are recorded as lookups of
+    the same key in TRANSFORMS instead."""
+    if CALIB:
+        return
+    import sqlglot.generator as g
+
+    orig = g._build_dispatch
+
+    def build(cls):
+        global _active
+        tr = cls.TRANSFORMS  # (records the attribute read)
+        was = _active
+        _active = False
+        try:
+            d = orig(cls)
+        finally:
+            _active = was
+        if isinstance(tr, _RD):
+            rd = _RD(d)
+            rd._t = tr._t
+            return rd
+        return d
+
+    g._build_dispatch = build
+
+
+_dispatch_by_key()
 
 
 def _cls_key(c) -> str:
@@ -184,6 +350,17 @@ def _lk_keys(c, a: str) -> list[str]:
             kb = class_keys.get(id(b))
             if kb is not None:
                 out.append(f"{kb}|{a}")
+    return out
+
+
+def _kl_out() -> dict:
+    out: dict = {}
+    for t, keys in _kl.items():
+        if t in _kla:
+            continue
+        ids = sorted({fingerprint.LEN_KEY if k is _LEN else fingerprint.key_id(k) for k in keys})
+        for tag in KL_TAGS[t]:
+            out[tag] = ids
     return out
 
 
@@ -216,6 +393,8 @@ def run_child(num: int) -> None:
 
     _reads.clear()
     _lk.clear()
+    _kl.clear()
+    _kla.clear()
     spawned = []
     import subprocess as _sp
     import multiprocessing.process as _mpp
@@ -271,6 +450,9 @@ def run_child(num: int) -> None:
         "lk": sorted({k for c, a in _lk for k in _lk_keys(c, a)}),
         "reads": sorted(_reads),
         "spawned": spawned,
+        "kl": _kl_out(),
+        "kla": sorted({tag for t in _kla for tag in KL_TAGS[t]}),
+        **({"kldbg": _DBG_HITS} if _DBG else {}),
     }
     tmp = os.path.join(OUT, f".{num}.json")
     with _orig_open(tmp, "w") as f:
@@ -284,6 +466,8 @@ def main() -> None:
         json.dump(module_reads, f)
     with _orig_open(os.path.join(OUT, "_import_lines.json"), "w") as f:
         json.dump({k: sorted(v) for k, v in _imp_lines.items()}, f)
+    with _orig_open(os.path.join(OUT, "_kl_tags.json"), "w") as f:
+        json.dump(sorted({tag for tags in KL_TAGS for tag in tags}), f)  # dicts recorded by key
     todo = [n for n in sorted(loaded) if not os.path.exists(os.path.join(OUT, f"{n}.json"))]
     if ONLY:
         todo = [n for n in todo if str(n) in ONLY]

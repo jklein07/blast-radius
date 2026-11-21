@@ -197,6 +197,10 @@ for _i, _c in M.get("vcpu", {}).items():
     if _n is not None:
         VCPU[_n] = _c
 SPAWNERS = {_local2num[i] for i in M.get("spawners", []) if _local2num[i] is not None}
+# dict-valued class attributes the tracer recorded by key (tracer.py _RD)
+KLTAGS = set(M.get("kltags", ()))
+KL: dict = M.get("kl", {})  # "class|attr" -> {key id: setid of tests that looked it up}
+KLA: dict = M.get("kla", {})  # "class|attr" -> setid of tests that read it as a whole
 HEAVY_FILES = {"tests/test_optimizer.py", "tests/test_executor.py"}
 MOD_IMPORTS: dict = M.get("mod_imports", {})
 _IMPORTERS: dict = {}
@@ -861,6 +865,52 @@ def class_subtree(pristine: dict, patched: dict):
     return subtree
 
 
+SNAPDK = os.environ.get("BR_SNAPDK", os.path.splitext(SNAP)[0] + "dk.json")
+_DK: dict | None = None
+
+
+def pristine_dk() -> dict:
+    global _DK
+    if _DK is None:
+        try:
+            with open(SNAPDK) as fh:
+                _DK = json.load(fh)
+        except (OSError, ValueError):
+            _DK = {}
+    return _DK
+
+
+def dict_key_tests(key: str, attr: str, live: dict) -> set | None:
+    """Tests a change to the dict held in class attribute key.attr can reach:
+    those that looked up a key whose entry changed (or the size, if it
+    changed), and those that read the dict as a whole. None when that cannot
+    be decided by key."""
+    import fingerprint
+
+    tag = f"{key}|{attr}"
+    old = pristine_dk().get(tag)
+    c = live.get(key)
+    if tag not in KLTAGS or old is None or c is None:
+        return None
+    v = c.__dict__.get(attr)
+    if type(v) is not dict:
+        return None
+    new = fingerprint.dict_key_fps(v)
+    changed = [k for k in old.keys() | new.keys() if old.get(k) != new.get(k)]
+    if not changed:
+        return None  # a difference the entries do not show (order ...)
+    out: set = set()
+    sid = KLA.get(tag)
+    if sid is not None:
+        out.update(SETS[sid])
+    d = KL.get(tag, {})
+    for k in changed:
+        sid = d.get(k)
+        if sid is not None:
+            out.update(SETS[sid])
+    return out
+
+
 def snapshot_candidates(pristine: dict, patched: dict, diff: dict, plan: Plan) -> tuple[set, bool]:
     """Tests affected by changed import-time state. Returns (tests, everything)."""
     out: set = set()
@@ -870,9 +920,19 @@ def snapshot_candidates(pristine: dict, patched: dict, diff: dict, plan: Plan) -
             return set(ALL), True
     subtree = class_subtree(pristine, patched)
 
+    live = None
     for key, attr in diff["attrs"]:
         if attr == "__doc__":
             continue  # docstrings: nothing reads them at runtime
+        if f"{key}|{attr}" in KLTAGS:
+            if live is None:
+                import fingerprint
+
+                live = dict(fingerprint.iter_classes(sorted(sys.modules), "sqlglot"))
+            t = dict_key_tests(key, attr, live)
+            if t is not None:
+                out |= t
+                continue
         sub = subtree(key)
         if attr == "*":
             for x in sub:

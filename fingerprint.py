@@ -288,3 +288,52 @@ def diff(a: dict, b: dict, only: set | None = None) -> dict:
                 changed_globals.append((m, name))
     err = sorted(set(a["errors"].items()) ^ set(b["errors"].items()))
     return {"attrs": sorted(changed_attrs), "globals": sorted(changed_globals), "errors": err}
+
+
+# ------------------------------------------------------- dict entries by key
+def key_id(k) -> str:
+    """A process-independent id for a dict key. Keys that compare equal
+    across types (True == 1 == 1.0, a str-valued enum member and its string)
+    get the same id, because a lookup with either finds the same entry."""
+    import fractions as _fr
+    import numbers as _nb
+
+    if isinstance(k, str):
+        return "s:" + k  # str subclasses (str-valued enums) hash and compare as their text
+    if isinstance(k, _nb.Number) and not isinstance(k, enum.Enum) or isinstance(k, (int, float)):
+        try:
+            if k == k:
+                if isinstance(k, complex):
+                    k = k.real if k.imag == 0 else k
+                if not isinstance(k, complex):
+                    return "n:" + str(_fr.Fraction(k))
+        except (TypeError, ValueError, OverflowError):
+            pass
+    if type(k) is tuple:
+        return "(" + ",".join(key_id(x) for x in k) + ")"
+    return fp(k, 3)
+
+
+LEN_KEY = "#len"  # pseudo-key for the dict's size (len(), truth tests)
+
+
+def dict_key_fps(d: dict) -> dict:
+    """key id -> fingerprint of the value; entries whose key ids collide are
+    combined, so a change to either shows. LEN_KEY holds the size."""
+    out: dict = {LEN_KEY: str(len(d))}
+    for k, v in d.items():
+        kid, vf = key_id(k), fp(v)
+        out[kid] = vf if kid not in out else "+".join(sorted(out[kid].split("+") + [vf]))
+    return out
+
+
+def dict_snapshot(root_pkg: str = "sqlglot") -> dict:
+    """'class key|attr' -> dict_key_fps for every dict-valued class attribute."""
+    out: dict = {}
+    for key, c in list(iter_classes(sorted(sys.modules), root_pkg)):
+        if isinstance(c, enum.EnumMeta):
+            continue
+        for name, v in list(c.__dict__.items()):
+            if type(v) is dict and not (name.startswith("__") and name.endswith("__")):
+                out[f"{key}|{name}"] = dict_key_fps(v)
+    return out
