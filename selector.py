@@ -2619,7 +2619,7 @@ def fe_check(vfe: dict) -> set:
         tid = SPLIT_NUMS[n]
         fe = fe_maps().get(tid) or {}
         try:
-            if tpcfp.differing(tid, idx, fe.get("arts", {})):
+            if tpcfp.differing(tid, idx, fe.get("arts", {}), fe.get("lean")):
                 failing.add(n)
         except BaseException:  # noqa: BLE001
             failing.add(n)
@@ -2648,7 +2648,7 @@ def fe_check_queries(vfe: dict) -> tuple[set, dict]:
         try:
             # a front end that hangs counts as differing
             signal.setitimer(signal.ITIMER_REAL, 5.0 + 4.0 * c)
-            D = tpcfp.differing_upto(tid, idx, fe.get("arts", {}), FE_RUN_MAX)
+            D = tpcfp.differing_upto(tid, idx, fe.get("arts", {}), FE_RUN_MAX, fe.get("lean"))
             signal.setitimer(signal.ITIMER_REAL, 0)
         except BaseException:  # noqa: BLE001
             signal.setitimer(signal.ITIMER_REAL, 0)

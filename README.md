@@ -173,6 +173,14 @@ them across workers.
    pair (`cftrace.py`, `cfsel.py`), unless the change reaches code the test
    runs outside its pairs (a schema it builds for every pair, say): then it
    runs whole.
+   When a change reaches only the front end of a TPC executor test (parse,
+   optimize, plan, transpile), the selector recomputes what that front end
+   hands each query's execution and compares it with the pinned commit's
+   (`tpcfp.py`, `ftrace.py`): the same hand-over means the same result. A
+   plan may also match without the expression slots (type, metadata,
+   comments) that executing that query never reads except to copy them.
+   `ftrace_lean.py` records which slots each query reads, under three hash
+   seeds. The untouched execution side then takes the same steps.
 6. **Data files → file reads.** SQL fixtures and other files map to the tests
    that opened them (or whose module opened them while importing). A new
    top-level module named like a standard-library module (or
@@ -270,6 +278,7 @@ references).
 | `build_core.py` | Build-time: the modules `import sqlglot` runs, `maps/core.json` |
 | `build_regcov.py` | Build-time: lines tests run only with the dialect registry emptied, `maps/regcov.json.gz` |
 | `qtrace.py`, `build_split.py` | Build-time: per-query coverage of the TPC tests, `maps/split.json.gz` |
+| `tpcfp.py`, `ftrace.py`, `build_fe.py`, `ftrace_lean.py` | Front-end fingerprints of the TPC executor tests, `maps/fe.json.gz` |
 | `cftrace.py`, `build_cf.py`, `cfsel.py` | Per-pair coverage of the fixture-driven optimizer tests, `maps/cf.json.gz`; `cfsel.py` runs such a test on chosen pairs |
 
 ## Rebuilding the maps
@@ -291,6 +300,9 @@ PYTHONHASHSEED=0 python qtrace.py /opt/sqlglot out/qtrace.json 4
 python build_split.py out/qtrace.json maps/split.json.gz
 PYTHONHASHSEED=0 python cftrace.py /opt/sqlglot out/cftrace 10
 python build_cf.py out/cftrace maps/cf.json.gz
+PYTHONHASHSEED=0 python ftrace.py /opt/sqlglot out/ftrace.json
+python build_fe.py out/ftrace.json maps/fe.json.gz
+python ftrace_lean.py /opt/sqlglot maps/fe.json.gz
 ```
 
 ## Third-party code
