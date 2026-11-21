@@ -132,6 +132,11 @@ class _Walker:
             self.report(stmt, ctx, stmt, None)
 
     def seq(self, la, lb, ctx, stmt, parent):
+        # A statement that is only a constant (a docstring, a bare string or
+        # `...`) compiles to nothing; at most it sets __doc__, which nothing in
+        # sqlglot or its tests reads at runtime. Compare without them.
+        la = [x for x in la if not _noop(x)]
+        lb = [x for x in lb if not _noop(x)]
         if not la and not lb:
             return
         da = [self._key(x, self.ol) for x in la]
@@ -264,6 +269,10 @@ class _Walker:
             elif isinstance(t, (ast.Import, ast.ImportFrom)):
                 for al in t.names:
                     self.c.toplevel_names.add((al.asname or al.name).split(".")[0])
+
+
+def _noop(x) -> bool:
+    return isinstance(x, ast.Expr) and isinstance(x.value, ast.Constant)
 
 
 def _dump_any(x) -> str:

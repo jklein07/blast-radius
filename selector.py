@@ -315,9 +315,28 @@ def split_maps() -> dict:
     return _SPLIT
 
 
+_FE = None
+
+
+def fe_maps() -> dict:
+    global _FE
+    if _FE is None:
+        try:
+            with gzip.open(os.path.join(os.path.dirname(MAPS), "fe.json.gz"), "rt") as fh:
+                _FE = json.load(fh)
+            for v in _FE.values():
+                v["_exec"] = {f: set(ls) for f, ls in v["exec"].items()}
+        except Exception:  # noqa: BLE001
+            _FE = {}
+    return _FE
+
+
 def split_queries(n: int, plan) -> tuple | None:
-    """(attr, query indexes, nq, CPU cost) when test n can be verified on only
-    the queries that execute a changed line; None when it must run whole."""
+    """(attr, query indexes, nq, CPU cost, mode) when test n can be verified
+    on only the queries that execute a changed line; None when it must run
+    whole. mode "fe": every changed line it runs belongs to its front end
+    (parse, optimize, plan, transpile), so comparing those artifacts with the
+    pinned commit's decides it (tpcfp.py); mode "run": run those queries."""
     tid = SPLIT_NUMS.get(n)
     if tid is None or n in plan.cands.other:
         return None
@@ -327,6 +346,8 @@ def split_queries(n: int, plan) -> tuple | None:
         return None
     setup = sm_all.get("setup", {})
     tfile = FILE_OF[n]
+    fe = fe_maps().get(tid)
+    fe_ok = fe is not None
     q = 0
     for rel, ch in plan.py_changes.items():
         if not rel.startswith("sqlglot/") or not ch.semantic:
@@ -365,6 +386,9 @@ def split_queries(n: int, plan) -> tuple | None:
                     hit.add(ln)
         su = set(setup.get(rel, ()))
         lm = sm["lines"].get(rel, {})
+        ex = fe["_exec"].get(rel, ()) if fe_ok else ()
+        if fe_ok and any(l in ex for l in hit):
+            fe_ok = False  # the executor, data loading or comparison side runs it
         for l in hit:
             if l in su:
                 return None  # setUpClass runs it: every query depends on it
@@ -373,11 +397,16 @@ def split_queries(n: int, plan) -> tuple | None:
                 return None  # the whole test runs it but no single query does
             q |= int(m, 16)
     nq = sm["nq"]
-    if q == 0 or q == (1 << nq) - 1:
+    if q == 0:
         return None
     idx = [i for i in range(nq) if q >> i & 1]
+    if fe_ok and fe.get("nq") == nq and not (set(idx) & set(fe.get("unstable", ()))):
+        cost = 0.3 + sum(fe["cpu"].get(str(i), 0.05) for i in idx)
+        return sm["attr"], idx, nq, round(cost, 3), "fe"
+    if q == (1 << nq) - 1:
+        return None
     cost = sm["fixed"] + sum(sm["warm"][i] for i in idx) + max(sm["cold"][i] - sm["warm"][i] for i in idx)
-    return sm["attr"], idx, nq, round(cost, 3)
+    return sm["attr"], idx, nq, round(cost, 3), "run"
 
 
 def split_plan(plan, cands=None) -> dict:
@@ -438,8 +467,11 @@ def choose_verify(cands: dict, already_forked: bool, split: dict | None = None) 
     def vc(n):
         return split[n][3] if n in split else vcost(n)
 
+    def sc(n):
+        return 0.0 if n in split and split[n][4] == "fe" else setup_cost(n)
+
     def key(n):
-        return ((vc(n) + setup_cost(n)) / max(1e-3, 1.0 - cands[n]), n)
+        return ((vc(n) + sc(n)) / max(1e-3, 1.0 - cands[n]), n)
 
     free.sort(key=key)
     m = len(free)
@@ -450,7 +482,7 @@ def choose_verify(cands: dict, already_forked: bool, split: dict | None = None) 
     for n in free:
         extra = 0.0
         k_ = _cls(n)
-        if k_ not in seen_cls:
+        if sc(n) and k_ not in seen_cls:
             seen_cls.add(k_)
             extra = setup_cost(n)
         prefix.append(prefix[-1] + vc(n) + extra)
@@ -466,7 +498,44 @@ def choose_verify(cands: dict, already_forked: bool, split: dict | None = None) 
         if best is None or cost < best[0] - 1e-9:
             best = (cost, k)
     k = best[1]
-    return free[:k], fixed + free[k:]
+    choice = (free[:k], fixed + free[k:])
+    # The query-looping TPC tests dominate a schedule they are in, but come
+    # last in the cheap-first order above. Also price verifying them always,
+    # plus a cheap-first prefix of the rest.
+    B = [n for n in free if n in split]
+    if B:
+        nb = [n for n in free if n not in split]
+        m2 = len(nb)
+        pre = [0.0]
+        pn = [1.0]
+        seen2: set = set()
+        for n in nb:
+            extra = 0.0
+            k_ = _cls(n)
+            if sc(n) and k_ not in seen2:
+                seen2.add(k_)
+                extra = setup_cost(n)
+            pre.append(pre[-1] + vc(n) + extra)
+            pn.append(pn[-1] * (1.0 - cands[n]))
+        vb = sum(vc(n) + sc(n) for n in B)
+        pb = 1.0
+        for n in B:
+            pb *= 1.0 - cands[n]
+        for k2 in sorted({0, 1, 2, 3, 5, 8, 12, 20, 30, m2 // 2, m2} & set(range(m2 + 1))):
+            U = fixed + nb[k2:]
+            P = nb[:k2]
+            s_u = sched_cost_ms(U) / 1000.0
+            s_ub = sched_cost_ms(U + B) / 1000.0
+            if k2:
+                s_up = sched_cost_ms(U + P) / 1000.0
+                s_upb = sched_cost_ms(U + P + B) / 1000.0
+            else:
+                s_up, s_upb = s_u, s_ub
+            cost = ovh + pre[k2] + vb + pb * (pn[k2] * s_u + (1 - pn[k2]) * s_up) + (1 - pb) * (pn[k2] * s_ub + (1 - pn[k2]) * s_upb)
+            if cost < best[0] - 1e-9:
+                best = (cost, k2)
+                choice = (P + B, U)
+    return choice
 
 
 # ------------------------------------------------------------------- analysis
@@ -769,6 +838,8 @@ def snapshot_candidates(pristine: dict, patched: dict, diff: dict, plan: Plan) -
         return {k} | children.get(k, set())
 
     for key, attr in diff["attrs"]:
+        if attr == "__doc__":
+            continue  # docstrings: nothing reads them at runtime
         sub = subtree(key)
         if attr == "*":
             for x in sub:
@@ -792,6 +863,8 @@ def snapshot_candidates(pristine: dict, patched: dict, diff: dict, plan: Plan) -
             # enum members, descriptors): every user of the class family
             out |= family_tests(key, sub)
     for mod, name in diff["globals"]:
+        if name == "__doc__":
+            continue
         out |= global_ref_tests(mod, name)
     # import-time edits the fingerprints could not see: fall back to everything
     # that refers to the names those statements bind
@@ -934,7 +1007,7 @@ def _on_alarm(*_):
 def _apply_split(split: dict) -> None:
     """Cut the query lists setUpClass loads down to the queries to verify."""
     by_cls: dict = {}
-    for n, (attr, idx, nq, _c) in split.items():
+    for n, (attr, idx, nq, _c, _m) in split.items():
         parts = TESTS_BY_NUM[n]["id"].split("::")
         mod = sys.modules.get(FILE_OF[n][:-3].replace("/", "."))
         cls = getattr(mod, parts[1], None) if mod is not None and len(parts) > 2 else None
@@ -1023,6 +1096,25 @@ def run_tests(nums: list[int], split: dict | None = None) -> tuple[set, set]:
 TESTS_BY_NUM = {t["number"]: t for t in TESTS}
 
 
+def fe_check(vfe: dict) -> set:
+    """Tests whose front-end artifacts differ from the pinned commit's on
+    one of their queries (or cannot be computed): those count as failing."""
+    failing = set()
+    try:
+        import tpcfp
+    except Exception:  # noqa: BLE001
+        return set(vfe)
+    for n, (attr, idx, nq, _c, _m) in vfe.items():
+        tid = SPLIT_NUMS[n]
+        fe = fe_maps().get(tid) or {}
+        try:
+            if tpcfp.differing(tid, idx, fe.get("arts", {})):
+                failing.add(n)
+        except BaseException:  # noqa: BLE001
+            failing.add(n)
+    return failing
+
+
 def child_main(plan: Plan, wfd: int) -> None:
     """Runs in a forked child. Writes one JSON object to wfd."""
     result: dict = {"cid": plan.cid}
@@ -1054,9 +1146,14 @@ def child_main(plan: Plan, wfd: int) -> None:
             split = {n: v for n, v in plan.split.items() if n not in cands.other}
             verify, include = choose_verify(cands, True, split)
             vsplit = {n: v for n, v in split.items() if n in verify}
-            failing, _ = run_tests(verify, vsplit) if verify else (set(), set())
+            vfe = {n: v for n, v in vsplit.items() if v[4] == "fe"}
+            vrun = {n: v for n, v in vsplit.items() if v[4] != "fe"}
+            rest = [n for n in verify if n not in vfe]
+            failing, _ = run_tests(rest, vrun) if rest else (set(), set())
+            if vfe:
+                failing |= fe_check(vfe)
             if vsplit:
-                result["split"] = {str(n): [len(v[1]), v[3], n in failing] for n, v in vsplit.items()}
+                result["split"] = {str(n): [len(v[1]), v[3], v[4], n in failing] for n, v in vsplit.items()}
             result["select"] = sorted(set(include) | failing)
             result["verified"] = len(verify)
             result["failing_verified"] = sorted(failing)
