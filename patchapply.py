@@ -36,6 +36,24 @@ class Hunk:
         return out
 
 
+    def changed_new_lines(self) -> list[int]:
+        """1-based line numbers in the NEW file that were added, plus the new
+        lines around each deletion point."""
+        out: list[int] = []
+        ln = self.new_start
+        for raw in self.lines:
+            tag = raw[:1]
+            if tag == " ":
+                ln += 1
+            elif tag == "+":
+                out.append(ln)
+                ln += 1
+            elif tag == "-":
+                out.append(max(ln - 1, 1))
+                out.append(ln)
+        return out
+
+
 @dataclass
 class FilePatch:
     old_path: str | None
@@ -49,6 +67,14 @@ class FilePatch:
     @property
     def path(self) -> str:
         return self.new_path or self.old_path or ""
+
+    def changed_lines(self) -> tuple[set, set]:
+        old: set = set()
+        new: set = set()
+        for h in self.hunks:
+            old.update(h.changed_old_lines())
+            new.update(h.changed_new_lines())
+        return old, new
 
     def added_text(self) -> list[str]:
         return [l[1:] for h in self.hunks for l in h.lines if l.startswith("+")]

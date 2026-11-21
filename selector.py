@@ -402,7 +402,8 @@ def analyze(cid: str, text: str) -> Plan:
         for r in rels:  # tests that open the file itself (source readers too)
             plan.cands.add(tests_reading(r, listing), P_CODE if r.endswith(".py") else P_DATA)
         if path.endswith(".py") and (path.startswith("sqlglot/") or path.startswith("tests/")):
-            ch = astdiff.analyze(old, new)
+            oc, nc = fp.changed_lines() if (old is not None and new is not None and not fp.is_new) else (None, None)
+            ch = astdiff.analyze(old, new, oc, nc)
             if old_rel != new_rel and old_rel and new_rel:
                 ch.semantic = True
                 ch.import_time = True

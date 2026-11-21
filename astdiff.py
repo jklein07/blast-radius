@@ -48,17 +48,40 @@ def _stmt_lines(n) -> set:
     return set(range(n.lineno, (n.end_lineno or n.lineno) + 1))
 
 
-class _Walker:
-    def __init__(self, change: PyChange):
-        self.c = change
+_BIG = 40  # lines: above this, compare by recursing instead of dumping
 
-    # ctx: tuple of ancestor nodes in the OLD tree (outermost first)
+
+def _span(x):
+    if not isinstance(x, ast.AST) or not hasattr(x, "lineno"):
+        return None
+    first = x.lineno
+    decs = getattr(x, "decorator_list", None)
+    if decs:
+        first = min([first] + [d.lineno for d in decs])
+    return first, (getattr(x, "end_lineno", None) or x.lineno)
+
+
+class _Walker:
+    def __init__(self, change: PyChange, old_lines=None, new_lines=None):
+        self.c = change
+        self.ol = old_lines
+        self.nl = new_lines
+
+    def _key(self, x, lines):
+        """Source text of an element (whole lines). Equal text means an equal
+        subtree, so only elements whose text differs need a closer look."""
+        sp = _span(x)
+        if sp is not None and lines is not None:
+            return "\n".join(lines[sp[0] - 1 : sp[1]])
+        return _dump_any(x)
+
     def node(self, a, b, ctx, stmt):
         if type(a) is not type(b):
             self.report(a, ctx, stmt, None)
             return
         if isinstance(a, ast.AST):
-            if _dump(a) == _dump(b):
+            sp = _span(a)
+            if (sp is None or sp[1] - sp[0] <= _BIG) and _dump(a) == _dump(b):
                 return
             if isinstance(a, ast.stmt):
                 stmt = a
@@ -89,8 +112,10 @@ class _Walker:
             self.report(stmt, ctx, stmt, None)
 
     def seq(self, la, lb, ctx, stmt, parent):
-        da = [_dump_any(x) for x in la]
-        db = [_dump_any(x) for x in lb]
+        if not la and not lb:
+            return
+        da = [self._key(x, self.ol) for x in la]
+        db = [self._key(x, self.nl) for x in lb]
         if da == db:
             return
         sm = difflib.SequenceMatcher(a=da, b=db, autojunk=False)
@@ -205,7 +230,8 @@ def _qual(ctx, name) -> str:
     return ".".join(parts + [name])
 
 
-def analyze(old_src: str | None, new_src: str | None) -> PyChange:
+def analyze(old_src: str | None, new_src: str | None, old_changed=None, new_changed=None) -> PyChange:
+    """old_changed/new_changed are accepted for compatibility and unused."""
     c = PyChange()
     try:
         a = ast.parse(old_src or "")
@@ -234,9 +260,9 @@ def analyze(old_src: str | None, new_src: str | None) -> PyChange:
     if ha != hb:
         c.semantic = True
         c.import_time = True
-    if _dump(a) == _dump(b):
+    if old_src == new_src:
         # also compare the encoding-sensitive bits: the module docstring etc. are in the AST already
         return c
-    c.semantic = True
-    _Walker(c).seq(a.body, b.body, (a,), None, a)
+    _Walker(c, (old_src or "").split("\n"), (new_src or "").split("\n")).seq(a.body, b.body, (a,), None, a)
+    c.semantic = bool(c.runtime_lines or c.import_time or c.def_changes or c.import_lines)
     return c
