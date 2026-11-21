@@ -58,6 +58,7 @@ P_ATTR = float(os.environ.get("BR_P_ATTR", "0.2"))
 P_TEST = float(os.environ.get("BR_P_TEST", "0.5"))
 P_LOW = 0.05
 DEBUG = os.environ.get("BR_DEBUG", "0") == "1"
+PRELOAD = os.environ.get("BR_PRELOAD", "1") == "1"
 
 for _v in ("OPENBLAS_NUM_THREADS", "OMP_NUM_THREADS", "MKL_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
     os.environ.setdefault(_v, "1")
@@ -2088,6 +2089,106 @@ def build_farm(cid: str, files: dict) -> str:
     return root
 
 
+def _core_modules() -> frozenset:
+    try:
+        with open(os.path.join(APP, "maps", "core.json")) as fh:
+            return frozenset(json.load(fh))
+    except Exception:  # noqa: BLE001
+        return frozenset()
+
+
+# the sqlglot modules `import sqlglot` runs at the pinned commit
+CORE = _core_modules()
+
+
+def _is_sqlglot(name: str) -> bool:
+    return name == "sqlglot" or name.startswith("sqlglot.")
+
+
+def preload_ok(plan) -> bool:
+    """May this commit's child start from the parent's pristine `import
+    sqlglot`? Only when the patch leaves alone every module that import runs
+    and every file it looks for: it may change existing sqlglot modules outside
+    that set and existing test-side files (not a package `__init__` or a
+    conftest), and it adds, deletes and renames nothing. A fresh import in the
+    child would then run exactly the code the parent ran."""
+    if not PRELOAD or not CORE or not plan.files:
+        return False
+    for rel, text in plan.files.items():
+        if text is None or not os.path.isfile(os.path.join(PRISTINE, rel)):
+            return False
+        if rel.startswith("sqlglot/"):
+            if not rel.endswith(".py") or module_of(rel) in CORE:
+                return False
+        elif not rel.startswith("tests/") or os.path.basename(rel) in ("__init__.py", "conftest.py"):
+            return False
+    return True
+
+
+def preload_core() -> bool:
+    """Import pristine sqlglot in the parent (unittest is already loaded, as
+    in a child). True when it loaded exactly CORE."""
+    before = set(sys.modules)
+    sys.path.insert(0, PRISTINE)
+    try:
+        import sqlglot  # noqa: F401
+        ok = True
+    except _ParentTimeout:
+        raise
+    except BaseException:  # noqa: BLE001
+        ok = False
+    finally:
+        if sys.path and sys.path[0] == PRISTINE:
+            del sys.path[0]
+    loaded = {m for m in set(sys.modules) - before if _is_sqlglot(m)}
+    return ok and loaded == CORE
+
+
+def purge_sqlglot() -> None:
+    for name in [m for m in sys.modules if _is_sqlglot(m)]:
+        del sys.modules[name]
+
+
+def rebase_core(root: str) -> bool:
+    """Make the preloaded modules look imported from the farm, as a fresh
+    import there would have them: their files, and above all the package
+    paths that submodules (the patched ones among them) are found through."""
+    old = os.path.join(PRISTINE, "")
+    new = os.path.join(root, "")
+
+    def fix(p):
+        if p is None:
+            return None
+        if not isinstance(p, str) or not p.startswith(old):
+            raise ValueError(p)
+        return new + p[len(old):]
+
+    try:
+        mods = [(n, m) for n, m in sys.modules.items() if _is_sqlglot(n)]
+        if {n for n, _ in mods} != CORE:
+            return False
+        plan = []
+        for _n, m in mods:
+            spec = m.__spec__
+            path = getattr(m, "__path__", None)
+            if path is not None and (not isinstance(path, list) or spec.submodule_search_locations is not path):
+                return False
+            plan.append((m, spec, fix(m.__file__), fix(getattr(m, "__cached__", None)), fix(spec.origin),
+                         fix(spec.cached), [fix(p) for p in path] if path is not None else None))
+    except Exception:  # noqa: BLE001
+        return False
+    for m, spec, file_, cached, origin, scached, path in plan:
+        m.__file__ = file_
+        m.__cached__ = cached
+        spec.origin = origin
+        spec.cached = scached
+        if path is not None:
+            m.__path__[:] = path  # the same list as spec.submodule_search_locations
+        if hasattr(m.__loader__, "path"):
+            m.__loader__.path = origin
+    return True
+
+
 class _Timeout(BaseException):
     pass
 
@@ -2449,6 +2550,11 @@ def child_main(plan: Plan, wfd: int) -> None:
     try:
         _ph("start")
         root = build_farm(plan.cid, plan.files)
+        pre = bool(getattr(plan, "preloaded", False)) and rebase_core(root)
+        if not pre:
+            purge_sqlglot()  # import it fresh from the farm
+        if DEBUG:
+            result["pre"] = pre
         _ph("farm")
         os.chdir(root)
         sys.path.insert(0, root)
@@ -2677,8 +2783,15 @@ def _main(st: dict) -> None:
             pass
     _ru = __import__("resource").getrusage(0)
     log(f"phase preimport cpu {_ru.ru_utime + _ru.ru_stime:.2f}")
+    # Children whose patch leaves every module `import sqlglot` runs alone can
+    # start from one pristine import in the parent instead of each importing
+    # it; they are forked after the others, so no other child inherits it.
+    # One import in the parent pays only if it saves at least two.
+    pre = {c for c in jobs if preload_ok(plans[c])}
+    if len(pre) < 2:
+        pre = set()
     # cheap first so a slow child cannot starve the rest
-    jobs.sort(key=lambda c: (plans[c].need_snapshot, sum(SEC[x] for x in plans[c].cands)))
+    jobs.sort(key=lambda c: (c in pre, plans[c].need_snapshot, sum(SEC[x] for x in plans[c].cands)))
     running: dict[int, tuple[str, int, float]] = st["running"]
     outputs: dict[str, dict] = st["outputs"]
     max_par = int(os.environ.get("BR_PAR", "2"))
@@ -2691,6 +2804,11 @@ def _main(st: dict) -> None:
     while queue or running:
         while queue and len(running) < max_par and time.time() - T0 < budget:
             cid = queue.pop(0)
+            if cid in pre and "core" not in st:
+                st["core"] = preload_core()
+                if os.environ.get("BR_GCFREEZE", "1") == "1":
+                    gc.freeze()
+            plans[cid].preloaded = cid in pre and st.get("core", False)
             r, w = os.pipe()
             pid = os.fork()
             if pid == 0:

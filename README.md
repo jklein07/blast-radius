@@ -151,6 +151,14 @@ them across workers.
    child stops it once it holds 1.3 GB more than at the fork (address space
    is capped too, far above that), and that commit keeps every candidate, so
    two children never take the container past its memory limit.
+   Most children never need their own `import sqlglot`. When a patch leaves
+   alone every module that import runs (`maps/core.json`) and adds, deletes
+   and renames nothing, changing only other existing sqlglot modules or
+   test-side files, the parent imports pristine sqlglot once and forks
+   those children after the others. Each points the imported modules'
+   files and package paths at its patched tree, so every other module, the
+   patched ones among them, loads from there, exactly as after a fresh
+   import.
 8. **Pack.** The final set goes onto 1–8 workers (longest first), choosing
    the worker count that minimises busiest-worker time + 2 s per worker.
 
@@ -191,6 +199,7 @@ references).
 | `tracer.py`, `modlines.py`, `build_maps.py`, `mksnap.py` | Build-time tools that produce `maps/maps.json.gz` and `snap.json` from the pinned commit |
 | `wmtrace.py`, `build_wm.py` | Build-time: comparison-swap profile, `maps/wm.json.gz` |
 | `bwtrace.py`, `build_bw.py` | Build-time: and/or-swap profile, `maps/bw.json.gz` |
+| `build_core.py` | Build-time: the modules `import sqlglot` runs, `maps/core.json` |
 | `qtrace.py`, `build_split.py` | Build-time: per-query coverage of the TPC tests, `maps/split.json.gz` |
 | `cftrace.py`, `build_cf.py`, `cfsel.py` | Per-pair coverage of the fixture-driven optimizer tests, `maps/cf.json.gz`; `cfsel.py` runs such a test on chosen pairs |
 
@@ -206,6 +215,7 @@ PYTHONHASHSEED=0 python wmtrace.py /opt/sqlglot tests.json out/wm 8
 python build_wm.py tests.json out/wm out/calib maps/wm.json.gz
 PYTHONHASHSEED=0 python bwtrace.py /opt/sqlglot tests.json out/bw 8
 python build_bw.py tests.json out/bw out/calib maps/bw.json.gz
+python build_core.py /opt/sqlglot maps/core.json
 PYTHONHASHSEED=0 python qtrace.py /opt/sqlglot out/qtrace.json 4
 python build_split.py out/qtrace.json maps/split.json.gz
 PYTHONHASHSEED=0 python cftrace.py /opt/sqlglot out/cftrace 10
