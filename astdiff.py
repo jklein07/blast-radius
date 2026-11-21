@@ -320,7 +320,7 @@ def _shape(x, y, m: dict, rev: dict) -> bool:
     if isinstance(x, ast.AST):
         for f in x._fields:
             vx, vy = getattr(x, f, None), getattr(y, f, None)
-            if f == "id" and isinstance(x, ast.Name):
+            if (f == "id" and isinstance(x, ast.Name)) or (f == "name" and isinstance(x, ast.ExceptHandler) and vx and vy):
                 if m.setdefault(vx, vy) != vy or rev.setdefault(vy, vx) != vx:
                     return False
             elif not _shape(vx, vy, m, rev):
