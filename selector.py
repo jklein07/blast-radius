@@ -951,13 +951,37 @@ def tests_reading(rel: str, listing: bool = False) -> set:
 _EXEC_CACHE: dict = {}
 
 
+def _pristine_code(rel: str, src: str | None):
+    """The module code the image compiled for the pinned file (its
+    __pycache__ entry), when src is exactly that file's text and the entry
+    is current: the same code compile() would build, without compiling."""
+    try:
+        import importlib.util
+        import marshal
+
+        if not src or read_pristine(rel) != src:
+            return None
+        path = os.path.join(PRISTINE, rel)
+        with open(importlib.util.cache_from_source(path), "rb") as fh:
+            data = fh.read()
+        if data[:4] != importlib.util.MAGIC_NUMBER or int.from_bytes(data[4:8], "little") != 0:
+            return None
+        st = os.stat(path)
+        if int.from_bytes(data[8:12], "little") != int(st.st_mtime) & 0xFFFFFFFF or int.from_bytes(data[12:16], "little") != st.st_size & 0xFFFFFFFF:
+            return None
+        return marshal.loads(data[16:])
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def exec_lines(rel: str, src: str | None) -> set:
     """Lines of the old source that carry bytecode (can fire a line event)."""
     v = _EXEC_CACHE.get(rel)
     if v is None:
         v = set()
         try:
-            stack = [compile(src or "", rel, "exec", dont_inherit=True)]
+            co = _pristine_code(rel, src)
+            stack = [co if co is not None else compile(src or "", rel, "exec", dont_inherit=True)]
             while stack:
                 co = stack.pop()
                 for _s, _e, ln in co.co_lines():
