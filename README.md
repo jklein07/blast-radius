@@ -8,8 +8,8 @@ them across workers.
 
 1. **AST diff, not text diff.** `astdiff.py` walks the old and new syntax trees
    together and reports the smallest subtrees that differ. Comments and
-   formatting change nothing, so they select nothing. Three other edits are
-   proved to change nothing before they are dropped:
+   formatting change nothing, so they select nothing. Other edits proved to
+   change nothing are dropped too:
    - *Renamed locals.* A function whose only difference is a consistent,
      one-to-one renaming of its local variables counts as unchanged only if
      scope analysis shows every renamed name is a non-parameter local of
@@ -23,6 +23,12 @@ them across workers.
    - *Moved definitions.* Undecorated functions with constant defaults and no
      annotations may swap places within a run of such definitions between
      identical statements, in a module or class body.
+   - *Renamed module-level names.* A function or constant bound once at
+     module level and renamed together with every use in its file is
+     unchanged when neither name appears in any other file a test run can
+     import or read, nothing in the file reads names by string or through
+     `globals()`/`vars()`, and (for a function) every use is a direct call,
+     so nothing can see its `__name__`.
    - *New modules nothing imports.* Python imports a module only by its name,
      and every dynamic import in sqlglot and its tests builds that name from
      text found somewhere (a dialect string, an attribute name, a fixed

@@ -709,9 +709,14 @@ def module_of(rel: str) -> str:
     return m
 
 
-def _mentions(word: str, texts) -> bool:
+_NOT_RUN = {"posts", "pdoc", "docs", "benchmarks", ".github"}  # top-level folders no test reads or imports
+
+
+def _mentions(word: str, texts, exclude=(), runtime_only: bool = False) -> bool:
     """Whether word occurs as a whole word in any of texts or in any file of
-    the pristine checkout."""
+    the pristine checkout (but the paths in exclude; with runtime_only, only
+    files a test run can import or read: tests read files under sqlglot/ and
+    tests/ only, and import nothing from docs or posts)."""
     import re
 
     pat = re.compile(r"(?<![A-Za-z0-9_])" + re.escape(word) + r"(?![A-Za-z0-9_])")
@@ -719,9 +724,14 @@ def _mentions(word: str, texts) -> bool:
         return True
     w = word.encode()
     bpat = re.compile(pat.pattern.encode())
+    skip = {os.path.join(PRISTINE, r) for r in exclude}
     for dp, dns, fns in os.walk(PRISTINE):
-        dns[:] = [d for d in dns if d not in (".git", "__pycache__")]
+        dns[:] = [d for d in dns if d not in (".git", "__pycache__") and not (runtime_only and dp == PRISTINE and d in _NOT_RUN)]
         for fn in fns:
+            if runtime_only and dp == PRISTINE and fn.endswith((".md", ".png")):
+                continue
+            if os.path.join(dp, fn) in skip:
+                continue
             try:
                 with open(os.path.join(dp, fn), "rb") as fh:
                     data = fh.read()
@@ -730,6 +740,20 @@ def _mentions(word: str, texts) -> bool:
             if w in data and bpat.search(data):
                 return True
     return False
+
+
+def patched_texts(fps) -> dict:
+    """New text of every file the patch leaves (None when unreadable)."""
+    out = {}
+    for fp in fps:
+        if fp.is_binary or fp.is_deleted or not fp.new_path:
+            continue
+        try:
+            old = read_pristine(fp.old_path) if fp.old_path and not fp.is_new else None
+            out[fp.new_path] = patchapply.apply_to_text(old, fp)
+        except Exception:  # noqa: BLE001
+            out[fp.new_path] = None
+    return out
 
 
 def unreferenced_new_modules(fps) -> set:
@@ -822,6 +846,14 @@ def analyze(cid: str, text: str) -> Plan:
         if path.endswith(".py") and (path.startswith("sqlglot/") or path.startswith("tests/")):
             oc, nc = fp.changed_lines() if (old is not None and new is not None and not fp.is_new) else (None, None)
             ch = astdiff.analyze(old, new, oc, nc)
+            if ch.global_renames and not fp.is_new and old_rel == new_rel and path.startswith("sqlglot/"):
+                texts = [t for r, t in patched_texts(fps).items() if r != path]
+                if any(_mentions(w, texts, (path,), True) for pair in ch.global_renames for w in pair):
+                    ch = astdiff.analyze(old, new, oc, nc, renames=False)
+                else:
+                    plan.notes.append(f"renamed {ch.global_renames} in {path}")
+            elif ch.global_renames:
+                ch = astdiff.analyze(old, new, oc, nc, renames=False)
             if old_rel != new_rel and old_rel and new_rel:
                 ch.semantic = True
                 ch.import_time = True

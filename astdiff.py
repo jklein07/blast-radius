@@ -40,6 +40,9 @@ class PyChange:
     # comparison: (site "line:col:end_line:end_col", old op, new op, old lines, index in runtime_groups)
     swaps: list = field(default_factory=list)
     plain_lines: set = field(default_factory=set)  # runtime_lines from every other kind of difference
+    # module-level names renamed everywhere in the file, (old, new); the
+    # caller must check that no other file mentions either
+    global_renames: list = field(default_factory=list)
 
 
 def _first(fn) -> int:
@@ -699,7 +702,135 @@ def _qual(ctx, name) -> str:
     return ".".join(parts + [name])
 
 
-def analyze(old_src: str | None, new_src: str | None, old_changed=None, new_changed=None) -> PyChange:
+# ------------------------------------------------ renamed module-level names
+# A function or constant bound once at module level and renamed, with every
+# use in the file renamed too, changes nothing the program can observe as
+# long as (a) no other file refers to either name (the caller checks), (b)
+# nothing reads it by a string (getattr, __all__ ...), and (c) for a
+# function, nothing sees the function object itself, only calls it: its
+# __name__, __qualname__ and code name are the only things that change.
+
+
+def _binders(tree) -> dict:
+    """Module-level names bound exactly once, by an undecorated def or a
+    plain assignment to that one name: name -> statement. (Not annotated
+    assignments: the module's __annotations__ is keyed by the name.)"""
+    seen: dict = {}
+    for st in tree.body:
+        n = None
+        if isinstance(st, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            n = st.name if not st.decorator_list else None
+            if n is None:
+                seen[st.name] = None
+        elif isinstance(st, ast.Assign) and len(st.targets) == 1 and isinstance(st.targets[0], ast.Name):
+            n = st.targets[0].id
+        if n is not None:
+            seen[n] = st if n not in seen else None
+    return {k: v for k, v in seen.items() if v is not None}
+
+
+def _word_in(text: str, name: str) -> bool:
+    import re
+
+    return re.search(r"(?<![A-Za-z0-9_])" + re.escape(name) + r"(?![A-Za-z0-9_])", text) is not None
+
+
+def _mentioned(tree, name: str, binder=None, calls_only: bool = False) -> bool:
+    """Whether tree refers to name other than through binder (its binding
+    statement) and loads of it (only as the callee of a call when
+    calls_only). Strings count, except statements that are only a constant
+    (docstrings)."""
+    parent: dict = {}
+    noop_consts = set()
+    for p in ast.walk(tree):
+        for ch in ast.iter_child_nodes(p):
+            parent[ch] = p
+        if isinstance(p, ast.Expr) and isinstance(p.value, ast.Constant):
+            noop_consts.add(id(p.value))
+    for x in ast.walk(tree):
+        if x is binder:
+            if isinstance(x, (ast.FunctionDef, ast.AsyncFunctionDef)) and any(
+                    isinstance(y, ast.ClassDef) for y in ast.walk(x)):
+                return True  # a class defined inside would change its __qualname__
+            continue
+        if isinstance(x, ast.Name):
+            if x.id != name:
+                continue
+            p = parent.get(x)
+            if binder is None:
+                return True
+            if p is binder:
+                continue  # the binding target itself
+            if not isinstance(x.ctx, ast.Load):
+                return True
+            if calls_only and not (isinstance(p, ast.Call) and p.func is x):
+                return True
+            continue
+        if isinstance(x, ast.Constant):
+            if isinstance(x.value, str) and id(x) not in noop_consts and _word_in(x.value, name):
+                return True
+            continue
+        for f in ("name", "attr", "arg", "asname", "rest", "id"):
+            v = getattr(x, f, None)
+            if isinstance(v, str) and (v == name or (f == "name" and isinstance(x, ast.alias) and _word_in(v, name))):
+                return True
+        for f in ("names", "kwd_attrs"):
+            v = getattr(x, f, None)
+            if isinstance(v, list) and any(isinstance(y, str) and y == name for y in v):
+                return True
+    return False
+
+
+def _frame_free(fn) -> bool:
+    for x in ast.walk(fn):
+        if isinstance(x, ast.Name) and x.id in _FRAME_NAMES:
+            return False
+        if isinstance(x, ast.Attribute) and x.attr in _FRAME_ATTRS:
+            return False
+    return True
+
+
+class _Rename(ast.NodeTransformer):
+    def __init__(self, old: str, new: str, binder):
+        self.old, self.new, self.binder = old, new, binder
+
+    def visit_Name(self, n):
+        if n.id == self.old:
+            n.id = self.new
+        return n
+
+    def generic_visit(self, n):
+        if n is self.binder and isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            n.name = self.new
+        return super().generic_visit(n)
+
+
+def _global_renames(a, b) -> list:
+    """Pairs (old, new) of module-level names renamed consistently in the
+    whole file. Rewrites b to use the old names, so the rest of the diff sees
+    only the other changes."""
+    ba, bb = _binders(a), _binders(b)
+    gone = [n for n in ba if n not in bb and not any(isinstance(s, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and s.name == n for s in b.body)]
+    new = [n for n in bb if n not in ba and not any(isinstance(s, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and s.name == n for s in a.body)]
+    if not gone or len(gone) != len(new):
+        return []
+    out = []
+    for o, n in zip(gone, new):
+        sa, sb = ba[o], bb[n]
+        func = isinstance(sa, (ast.FunctionDef, ast.AsyncFunctionDef))
+        if func != isinstance(sb, (ast.FunctionDef, ast.AsyncFunctionDef)) or type(sa) is not type(sb):
+            continue
+        if not (_frame_free(a) and _frame_free(b)):  # globals(), vars() ... see the module's names
+            return out
+        if (_mentioned(a, o, sa, func) or _mentioned(b, n, sb, func)
+                or _mentioned(a, n) or _mentioned(b, o)):
+            continue
+        _Rename(n, o, sb).visit(b)
+        out.append((o, n))
+    return out
+
+
+def analyze(old_src: str | None, new_src: str | None, old_changed=None, new_changed=None, renames: bool = True) -> PyChange:
     """old_changed/new_changed are accepted for compatibility and unused."""
     c = PyChange()
     try:
@@ -739,6 +870,8 @@ def analyze(old_src: str | None, new_src: str | None, old_changed=None, new_chan
     defs = _future_annotations(a) and _future_annotations(b)
     _strip_annotations(a, defs)
     _strip_annotations(b, defs)
+    if renames:
+        c.global_renames = _global_renames(a, b)
     skip = _permuted_imports(a.body, b.body)
     ba = [x for i, x in enumerate(a.body) if i not in skip]
     bb = [x for i, x in enumerate(b.body) if i not in skip]
