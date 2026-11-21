@@ -192,6 +192,33 @@ for _i, _c in M.get("vcpu", {}).items():
         VCPU[_n] = _c
 SPAWNERS = {_local2num[i] for i in M.get("spawners", []) if _local2num[i] is not None}
 HEAVY_FILES = {"tests/test_optimizer.py", "tests/test_executor.py"}
+MOD_IMPORTS: dict = M.get("mod_imports", {})
+_IMPORTERS: dict = {}
+for _m, _deps in MOD_IMPORTS.items():
+    for _d in _deps:
+        _IMPORTERS.setdefault(_d, set()).add(_m)
+
+
+def affected_modules(changed: set):
+    """Modules whose import-time state a change to `changed` can alter, or None
+    when unsure (then everything is fingerprinted)."""
+    if not MOD_IMPORTS or not changed:
+        return None
+    if any(m not in MOD_IMPORTS for m in changed):
+        return None
+    seen = set(changed)
+    stack = list(changed)
+    while stack:
+        m = stack.pop()
+        for imp in _IMPORTERS.get(m, ()):
+            if imp not in seen:
+                seen.add(imp)
+                stack.append(imp)
+    # import-time code of an affected module can mutate what it imports
+    out = set(seen)
+    for m in seen:
+        out.update(MOD_IMPORTS.get(m, ()))
+    return out
 
 
 def _cls(n: int) -> str:
@@ -688,8 +715,11 @@ def child_main(plan: Plan, wfd: int) -> None:
             import fingerprint
 
             pristine = pristine_snapshot()
-            patched = fingerprint.snapshot("sqlglot")
-            d = fingerprint.diff(pristine, patched)
+            changed_mods = {module_of(r) for r in plan.files if r.startswith("sqlglot/") and r.endswith(".py")}
+            only = affected_modules(changed_mods)
+            patched = fingerprint.snapshot("sqlglot", only)
+            d = fingerprint.diff(pristine, patched, only)
+            result["only"] = len(only) if only is not None else -1
             extra, everything = snapshot_candidates(pristine, patched, d, plan)
             cands.add(extra, P_ATTR)
             result["diff"] = {"attrs": d["attrs"][:50], "globals": d["globals"][:50], "errors": d["errors"][:5], "n": len(extra)}

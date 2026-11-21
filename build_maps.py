@@ -169,6 +169,53 @@ for m, names in mod_names.items():
             refs.add((f, ln))
         out_m[g] = sorted(refs)
 
+# import-time module graph of sqlglot: module -> sqlglot modules it imports
+# at module or class level (function-level imports run later, not at import)
+def _toplevel_imports(tree, me, is_pkg):
+    pkg = me if is_pkg else me.rpartition(".")[0]
+    out = set()
+
+    def visit(body):
+        for n in body:
+            if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            if isinstance(n, ast.Import):
+                for a in n.names:
+                    out.add(a.name)
+            elif isinstance(n, ast.ImportFrom):
+                base = n.module or ""
+                if n.level:
+                    parts = pkg.split(".")
+                    up = parts[: len(parts) - (n.level - 1)] if n.level > 1 else parts
+                    base = ".".join(up + ([n.module] if n.module else []))
+                out.add(base)
+                for a in n.names:
+                    out.add(base + "." + a.name)
+            for f in ("body", "orelse", "finalbody", "handlers"):
+                sub = getattr(n, f, None)
+                if isinstance(sub, list) and not isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    visit([x for x in sub if isinstance(x, ast.AST)])
+
+    visit(tree.body)
+    return out
+
+
+all_mods = {modname(f) for f in trees if f.startswith("sqlglot/")}
+mod_imports = {}
+for f, tree in trees.items():
+    if not f.startswith("sqlglot/"):
+        continue
+    me = modname(f)
+    deps = set()
+    for m in _toplevel_imports(tree, me, f.endswith("__init__.py")):
+        # a module import also imports its parent packages
+        parts = m.split(".")
+        for i in range(1, len(parts) + 1):
+            cand = ".".join(parts[:i])
+            if cand in all_mods and cand != me:
+                deps.add(cand)
+    mod_imports[me] = sorted(deps)
+
 # test import graph
 test_imports: dict[str, set] = {}
 for f, tree in trees.items():
@@ -245,7 +292,8 @@ maps = {
     "test_importers": {k: sorted(v) for k, v in importers.items()},
     "noverify": sorted(noverify),
     "cpu": {str(k): v for k, v in cpu.items()},
-    "spawners": sorted(spawners),
+    "spawners": sorted(set(spawners)),
+    "mod_imports": mod_imports,
     "vcpu": vcpu,
 }
 os.makedirs(os.path.dirname(out) or ".", exist_ok=True)

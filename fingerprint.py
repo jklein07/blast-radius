@@ -186,7 +186,9 @@ def iter_classes(modules: list[str], root_pkg: str = "sqlglot"):
                 stack.append((v, f"{key}.{name}"))
 
 
-def snapshot(root_pkg: str = "sqlglot") -> dict:
+def snapshot(root_pkg: str = "sqlglot", only: set | None = None) -> dict:
+    """only: if given, fingerprint just the classes and globals of these modules
+    (classes are still discovered through every module so keys stay stable)."""
     pkg_dir = None
     try:
         import importlib.util
@@ -201,6 +203,8 @@ def snapshot(root_pkg: str = "sqlglot") -> dict:
     classes: dict[str, dict[str, str]] = {}
     bases: dict[str, list[str]] = {}
     for key, c in iter_classes(sorted(sys.modules), root_pkg):
+        if only is not None and key.partition(":")[0] not in only:
+            continue
         if key in classes:
             # same qualname defined twice (e.g. dynamic type()); merge conservatively
             key = key + f"#{len([k for k in classes if k.startswith(key)])}"
@@ -215,6 +219,8 @@ def snapshot(root_pkg: str = "sqlglot") -> dict:
     for mname in sorted(sys.modules):
         if not (mname == root_pkg or mname.startswith(root_pkg + ".")):
             continue
+        if only is not None and mname not in only:
+            continue
         mod = sys.modules[mname]
         g = {}
         for name, v in list(vars(mod).items()):
@@ -225,10 +231,15 @@ def snapshot(root_pkg: str = "sqlglot") -> dict:
     return {"classes": classes, "bases": bases, "globals": globals_, "errors": errors}
 
 
-def diff(a: dict, b: dict) -> dict:
-    """Changed (class, attr) pairs and module globals between snapshots a and b."""
+def diff(a: dict, b: dict, only: set | None = None) -> dict:
+    """Changed (class, attr) pairs and module globals between snapshots a and b,
+    optionally restricted to the given modules."""
+
+    def keep(key: str) -> bool:
+        return only is None or key.partition(":")[0] in only
+
     changed_attrs = []
-    for key in set(a["classes"]) | set(b["classes"]):
+    for key in {k for k in a["classes"] if keep(k)} | {k for k in b["classes"] if keep(k)}:
         ca = a["classes"].get(key)
         cb = b["classes"].get(key)
         if ca is None or cb is None:
@@ -238,7 +249,7 @@ def diff(a: dict, b: dict) -> dict:
             if ca.get(name) != cb.get(name):
                 changed_attrs.append((key, name))
     changed_globals = []
-    for m in set(a["globals"]) | set(b["globals"]):
+    for m in {k for k in a["globals"] if keep(k)} | {k for k in b["globals"] if keep(k)}:
         ga = a["globals"].get(m)
         gb = b["globals"].get(m)
         if ga is None or gb is None:
