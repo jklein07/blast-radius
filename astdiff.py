@@ -154,6 +154,7 @@ class _Walker:
         self._bswap = None
         self._src = (old_src, new_src)
         self._code: list = [None, None]
+        self.ta = self.tb = frozenset()  # names bound to the typing module (old, new)
 
     def _same_code(self, fa, fb) -> bool:
         """The compiled functions match instruction for instruction, with the
@@ -246,6 +247,18 @@ class _Walker:
         # sqlglot or its tests reads at runtime. Compare without them.
         la = [x for x in la if not _noop(x)]
         lb = [x for x in lb if not _noop(x)]
+        if isinstance(parent, (ast.Module, ast.ClassDef)) and self._func_ctx(ctx) is None:
+            # A def that the next statement rebinds (an overload stub before
+            # its implementation) is never seen: compare without those.
+            ka, kb = _dead_defs(la, self.ta), _dead_defs(lb, self.tb)
+            if ka or kb:
+                if [_dump(la[i]) for i in sorted(ka)] != [_dump(lb[j]) for j in sorted(kb)]:
+                    # their headers still run while the module imports: the
+                    # snapshot child imports the patched module, so a new
+                    # import error is still seen
+                    self.c.import_time = True
+                la = [x for i, x in enumerate(la) if i not in ka]
+                lb = [x for j, x in enumerate(lb) if j not in kb]
         if not la and not lb:
             return
         da = [self._key(x, self.ol) for x in la]
@@ -820,6 +833,55 @@ def _defaults_only(a, b) -> bool:
     return rest(aa) == rest(ba)
 
 
+def _typing_names(tree) -> frozenset:
+    """Names a module binds to the typing module (`import typing [as t]`)."""
+    out = set()
+    for s in tree.body:
+        if isinstance(s, ast.Import):
+            for al in s.names:
+                if al.name == "typing":
+                    out.add(al.asname or "typing")
+    return frozenset(out)
+
+
+def _loads(nodes, name: str) -> bool:
+    return any(isinstance(x, ast.Name) and x.id == name and not isinstance(x.ctx, ast.Store)
+               for n in nodes if n is not None for x in ast.walk(n))
+
+
+def _header(fn) -> list:
+    a = fn.args
+    params = a.posonlyargs + a.args + a.kwonlyargs + [x for x in (a.vararg, a.kwarg) if x is not None]
+    return list(fn.decorator_list) + list(a.defaults) + list(a.kw_defaults) + [p.annotation for p in params] + [fn.returns]
+
+
+def _dead_defs(stmts: list, typing_names) -> set:
+    """Indices of defs in a module or class body that the very next statement
+    rebinds with another def of the same name, which does not read the name
+    while its header runs. Such a binding is never seen (no metaclass in
+    sqlglot defines __prepare__). Building it must do nothing else: no
+    decorator other than typing.overload (which only records the stub in a
+    registry nothing reads), literal defaults only, no annotation left to
+    evaluate (they were blanked under `from __future__ import annotations`)."""
+    out = set()
+    for i in range(len(stmts) - 1):
+        a, b = stmts[i], stmts[i + 1]
+        if not (isinstance(a, (ast.FunctionDef, ast.AsyncFunctionDef)) and isinstance(b, (ast.FunctionDef, ast.AsyncFunctionDef))):
+            continue
+        if a.name != b.name or getattr(a, "type_params", None):
+            continue
+        if not all(isinstance(d, ast.Attribute) and d.attr == "overload" and isinstance(d.value, ast.Name)
+                   and d.value.id in typing_names for d in a.decorator_list):
+            continue
+        h = _header(a)
+        if any(x is not None and not _literal(x) for x in h[len(a.decorator_list):]):
+            continue
+        if _loads(_header(b), b.name):
+            continue
+        out.add(i)
+    return out
+
+
 def _dump_any(x) -> str:
     if isinstance(x, ast.AST):
         return _dump(x)
@@ -1171,7 +1233,9 @@ def analyze(old_src: str | None, new_src: str | None, old_changed=None, new_chan
     skip = _permuted_imports(a.body, b.body)
     ba = [x for i, x in enumerate(a.body) if i not in skip]
     bb = [x for i, x in enumerate(b.body) if i not in skip]
-    _Walker(c, (old_src or "").split("\n"), (new_src or "").split("\n"), old_src, new_src, renames).seq(ba, bb, (a,), None, a)
+    w = _Walker(c, (old_src or "").split("\n"), (new_src or "").split("\n"), old_src, new_src, renames)
+    w.ta, w.tb = _typing_names(a), _typing_names(b)
+    w.seq(ba, bb, (a,), None, a)
     c.semantic = bool(c.runtime_lines or c.import_time or c.def_changes or c.import_lines)
     return c
 

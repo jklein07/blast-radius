@@ -23,6 +23,16 @@ them across workers.
    - *Moved definitions.* Undecorated functions with constant defaults and no
      annotations may swap places within a run of such definitions between
      identical statements, in a module or class body.
+   - *Overwritten defs.* In a module or class body, a def that the very next
+     statement rebinds with another def of the same name (an overload stub
+     before its implementation) is never seen: no metaclass in sqlglot
+     defines `__prepare__`, and the next def's header must not read the
+     name. Building it must do nothing else: no decorator other than
+     `typing.overload` (which only records the stub in a registry nothing
+     reads), literal defaults only, and no annotation left to evaluate.
+     Such defs are left out of the comparison. When they differ, the
+     snapshot child still imports the patched module, so a new import error
+     is caught.
    - *Renamed module-level names.* A function or constant bound once at
      module level and renamed together with every use in its file is
      unchanged when neither name appears in any other file a test run can
