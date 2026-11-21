@@ -1231,6 +1231,10 @@ def snapshot_candidates(pristine: dict, patched: dict, diff: dict, plan: Plan) -
             continue  # docstrings: nothing reads them at runtime
         if fresh_member(key, attr, plan, pristine):
             continue  # a new member under a name nothing mentions
+        t = dispatch_member_tests(key, attr, plan, pristine, subtree(key))
+        if t is not None:
+            out |= t  # a new X_sql: tests that generated an X node
+            continue
         if f"{key}|{attr}" in KLTAGS:
             if live is None:
                 import fingerprint
@@ -1318,38 +1322,95 @@ def fresh_member(key: str, attr: str, plan: Plan, pristine: dict) -> bool:
     patched files. Nothing can read it by name, and on a class whose whole
     MRO is sqlglot code (no Enum, dataclass, NamedTuple or Protocol, no
     foreign metaclass) nothing enumerates members generically, except the
-    generator's dispatch on public *_sql methods."""
+    generator's dispatch on public *_sql methods (dispatch_member_tests)."""
+    if attr.endswith("_sql"):
+        return False
+    return _fresh_class(key, attr, plan, pristine) is not None
+
+
+def dispatch_member_tests(key: str, attr: str, plan: Plan, pristine: dict, sub: set) -> set | None:
+    """Tests a new public generator method X_sql can reach, when its name
+    appears nowhere else (as for fresh_member). The generator finds such a
+    method only by name: its dispatch table (built from dir(cls), keyed by
+    the class exp.EXPR_CLASSES[X]) and lookups of node.key + "_sql". Before
+    the patch, a node of that class with no handler went to
+    function_fallback_sql (it must be a Func), which reads the class's
+    arg_types; every key-based lookup reads its key. Both reads are recorded
+    through the node's class, so only tests that read something through a
+    class keyed X, and used the generator family, can change. None when the
+    rule does not apply."""
+    if not attr.endswith("_sql") or attr.startswith("_"):
+        return None
+    cls = _fresh_class(key, attr, plan, pristine)
+    if cls is None:
+        return None
+    try:
+        from sqlglot import exp
+        from sqlglot.generator import Generator
+    except Exception:  # noqa: BLE001
+        return None
+    if not issubclass(cls, Generator):
+        return None
+    x = attr[:-4]
+    targets: list = []
+    c = getattr(exp, "EXPR_CLASSES", {}).get(x)
+    if c is not None:
+        if not (isinstance(c, type) and issubclass(c, exp.Func)):
+            return None
+        targets.append(c)
+    try:
+        for v in _LIVE.values():
+            if isinstance(v, type) and issubclass(v, exp.Expr) and getattr(v, "key", None) == x and v not in targets:
+                targets.append(v)
+    except Exception:  # noqa: BLE001
+        return None
+    rev = {id(v): k for k, v in _LIVE.items()}
+    out: set = set()
+    for v in targets:
+        k = rev.get(id(v))
+        if k is None:
+            return None
+        sid = CLASSUSE.get(k)
+        if sid is not None:
+            out.update(SETS[sid])
+    return out & family_tests(key, sub) if out else out
+
+
+def _fresh_class(key: str, attr: str, plan: Plan, pristine: dict):
+    """The live class, when attr is a member the patch adds to it under a
+    name found in no pristine file and only once in the patched files, on a
+    class whose MRO is all sqlglot code; else None."""
     import re
 
-    if attr.startswith("__") or (attr.startswith("_") and attr.endswith("_")) or attr.endswith("_sql") or not attr.isidentifier():
-        return False
+    if attr.startswith("__") or (attr.startswith("_") and attr.endswith("_")) or not attr.isidentifier():
+        return None
     pc = (pristine.get("classes") or {}).get(key)
     if pc is None or attr in pc:
-        return False
+        return None
     if not _LIVE:
         import fingerprint
 
         _LIVE.update(dict(fingerprint.iter_classes(sorted(sys.modules), "sqlglot")))
     cls = _LIVE.get(key)
     if not isinstance(cls, type):
-        return False
+        return None
     import dataclasses
     import typing
 
     if dataclasses.is_dataclass(cls):
-        return False
+        return None
     meta = type(cls)
     if meta is not type and not (getattr(meta, "__module__", "") or "").startswith("sqlglot"):
-        return False
+        return None
     for k in cls.__mro__:
         if k is object or k is typing.Generic:
             continue
         if not (getattr(k, "__module__", "") or "").startswith("sqlglot"):
-            return False
+            return None
     pat = re.compile(r"(?<![A-Za-z0-9_])" + re.escape(attr) + r"(?![A-Za-z0-9_])")
     if sum(len(pat.findall(t)) for t in plan.files.values() if t) != 1:
-        return False
-    return not _mentions(attr, [])
+        return None
+    return None if _mentions(attr, []) else cls
 
 
 def family_tests(key: str, sub: set) -> set:
