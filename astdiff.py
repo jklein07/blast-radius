@@ -32,12 +32,17 @@ class PyChange:
     def_changes: list = field(default_factory=list)  # (qualname, old_first, old_last) of defs whose header changed
     toplevel_names: set = field(default_factory=set)  # names bound by changed module/class level statements
     class_quals: set = field(default_factory=set)  # qualnames of classes whose bodies changed at import level
+    # one entry per runtime difference: (old lines, first line of enclosing function, its last line)
+    runtime_groups: list = field(default_factory=list)
 
 
 def _first(fn) -> int:
     """co_firstlineno of a function: decorated defs start at their first decorator."""
     decs = getattr(fn, "decorator_list", None) or []
     return min([fn.lineno] + [d.lineno for d in decs])
+
+
+_COMPOUND = (ast.If, ast.For, ast.While, ast.With, ast.Try, ast.AsyncFor, ast.AsyncWith, ast.Match, ast.TryStar)
 
 
 def _dump(n) -> str:
@@ -171,15 +176,35 @@ class _Walker:
             lines = set()
             if hasattr(n, "lineno"):
                 lines |= set(range(n.lineno, (getattr(n, "end_lineno", None) or n.lineno) + 1))
+            else:
+                # operators (Eq, And, Add, ...) carry no position: use the
+                # innermost enclosing node that does
+                for anc in reversed(ctx):
+                    if hasattr(anc, "lineno") and not isinstance(anc, FUNC):
+                        lines |= set(range(anc.lineno, (getattr(anc, "end_lineno", None) or anc.lineno) + 1))
+                        break
             if stmt is not None and hasattr(stmt, "lineno") and stmt is not fn:
                 lines.add(stmt.lineno)
-                if not isinstance(stmt, (ast.If, ast.For, ast.While, ast.With, ast.Try, ast.AsyncFor, ast.AsyncWith, ast.Match, ast.TryStar)):
+                if isinstance(stmt, _COMPOUND):
+                    # the whole header expression: `if (` alone fires no line event
+                    for f in ("test", "iter", "target", "subject"):
+                        e = getattr(stmt, f, None)
+                        if isinstance(e, ast.AST) and hasattr(e, "lineno"):
+                            lines |= set(range(e.lineno, (e.end_lineno or e.lineno) + 1))
+                    for it in getattr(stmt, "items", None) or []:
+                        e = getattr(it, "context_expr", None)
+                        if e is not None:
+                            lines |= set(range(e.lineno, (e.end_lineno or e.lineno) + 1))
+                else:
                     lines |= _stmt_lines(stmt)
             if insertion or not lines:
                 lines.add(-_first(fn))
             if isinstance(n, FUNC) and n is not fn:
                 lines.add(-_first(n))
             self.c.runtime_lines |= lines
+            fn_first = _first(fn)
+            fn_last = getattr(fn, "end_lineno", None) or fn.lineno
+            self.c.runtime_groups.append((frozenset(lines), fn_first, fn_last))
             return
         # import-time difference
         self.c.import_time = True

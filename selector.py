@@ -199,6 +199,18 @@ for _m, _deps in MOD_IMPORTS.items():
         _IMPORTERS.setdefault(_d, set()).add(_m)
 
 
+def importer_closure(changed: set) -> set:
+    seen = set(changed)
+    stack = list(changed)
+    while stack:
+        m = stack.pop()
+        for imp in _IMPORTERS.get(m, ()):
+            if imp not in seen:
+                seen.add(imp)
+                stack.append(imp)
+    return seen
+
+
 def affected_modules(changed: set):
     """Modules whose import-time state a change to `changed` can alter, or None
     when unsure (then everything is fingerprinted)."""
@@ -403,7 +415,7 @@ def analyze(cid: str, text: str) -> Plan:
         rels = {r for r in (old_rel, new_rel) if r}
         if fp.is_binary:
             for r in rels:
-                plan.cands.add(tests_reading(r, True), P_DATA)
+                plan.cands.add(tests_reading(r, True), 1.0)  # not applied in the farm: never verify
             continue
         try:
             old = read_pristine(old_rel) if old_rel and not fp.is_new else None
@@ -438,9 +450,16 @@ def analyze(cid: str, text: str) -> Plan:
             if not ch.semantic:
                 continue
             if path.startswith("sqlglot/"):
-                sqlglot_change(plan, old_rel or path, ch)
+                sqlglot_change(plan, old_rel or path, ch, old)
             else:
-                test_change(plan, old_rel or path, ch)
+                test_change(plan, old_rel or path, ch, old)
+        elif path.endswith(".py") and any(r in COV for r in rels):
+            # code run by tests through runpy/subprocess paths the farm cannot
+            # reproduce (it resolves symlinks back to pristine): include, never verify
+            for r in rels:
+                fm = COV.get(r) or {}
+                for ln, sid_ in fm.items():
+                    plan.cands.add(SETS[sid_], 1.0)
         else:
             # data file (already added above as a read file)
             for r in rels:
@@ -467,13 +486,54 @@ def tests_reading(rel: str, listing: bool = False) -> set:
     return out
 
 
-def sqlglot_change(plan: Plan, rel: str, ch: astdiff.PyChange) -> None:
+_EXEC_CACHE: dict = {}
+
+
+def exec_lines(rel: str, src: str | None) -> set:
+    """Lines of the old source that carry bytecode (can fire a line event)."""
+    v = _EXEC_CACHE.get(rel)
+    if v is None:
+        v = set()
+        try:
+            stack = [compile(src or "", rel, "exec", dont_inherit=True)]
+            while stack:
+                co = stack.pop()
+                for _s, _e, ln in co.co_lines():
+                    if ln is not None:
+                        v.add(ln)
+                stack.extend(c for c in co.co_consts if hasattr(c, "co_lines"))
+        except Exception:  # noqa: BLE001
+            v = None
+        _EXEC_CACHE[rel] = v
+    return v
+
+
+def runtime_tests(rel: str, ch: astdiff.PyChange, old_src) -> set:
+    """Tests that execute a runtime difference. When no line of a difference
+    can fire a line event (a bare `if (` line, `nonlocal`, ...), blame its
+    whole function instead."""
+    out = cov_tests(rel, ch.runtime_lines)
+    fm = COV.get(rel) or {}
+    for lines, first, last in ch.runtime_groups:
+        if any(l in fm for l in lines):
+            continue
+        exe = exec_lines(rel, old_src)
+        if exe is not None and any(l > 0 and l in exe for l in lines):
+            continue  # executable, and no test ever ran it
+        t = cov_tests(rel, [-first])
+        if not t:
+            t = func_span_tests(rel, first, last)
+        out |= t
+    return out
+
+
+def sqlglot_change(plan: Plan, rel: str, ch: astdiff.PyChange, old_src=None) -> None:
     plan.cands.add(SPAWNERS, P_LOW)
     if ch.syntax_error:
         plan.need_snapshot = True  # the import error decides
         return
     if ch.runtime_lines:
-        plan.cands.add(cov_tests(rel, ch.runtime_lines), P_CODE)
+        plan.cands.add(runtime_tests(rel, ch, old_src), P_CODE)
         # functions that also run while sqlglot is imported change import-time state
         imp = set(IMPORT_LINES.get(rel, ()))
         if any(l in imp for l in ch.runtime_lines if l > 0):
@@ -484,7 +544,10 @@ def sqlglot_change(plan: Plan, rel: str, ch: astdiff.PyChange) -> None:
         plan.need_snapshot = True
 
 
-def test_change(plan: Plan, rel: str, ch: astdiff.PyChange) -> None:
+def test_change(plan: Plan, rel: str, ch: astdiff.PyChange, old_src=None) -> None:
+    if rel.endswith("__init__.py"):
+        d = os.path.dirname(rel) + "/"
+        plan.cands.add([n for f, ns in BY_FILE.items() if f.startswith(d) for n in ns], P_TEST)
     if ch.syntax_error or ch.import_time:
         plan.cands.add(BY_FILE.get(rel, []), P_TEST)
         for imp in TEST_IMPORTERS.get(rel, []):
@@ -493,7 +556,7 @@ def test_change(plan: Plan, rel: str, ch: astdiff.PyChange) -> None:
             # a helper module no test file is known to import: be safe
             plan.cands.add(tests_reading(rel), P_TEST)
     if ch.runtime_lines:
-        plan.cands.add(cov_tests(rel, ch.runtime_lines), P_TEST)
+        plan.cands.add(runtime_tests(rel, ch, old_src), P_TEST)
         for q, first, last in ch.def_changes:
             plan.cands.add(func_span_tests(rel, first, last), P_TEST)
 
@@ -546,11 +609,54 @@ def snapshot_candidates(pristine: dict, patched: dict, diff: dict, plan: Plan) -
         meth = method_lines(key, attr, pristine, patched)
         if meth is not None:
             out |= meth
-        elif not hit:
-            pass
+        elif not hit and (attr.startswith("__") or attr not in LK_BY_ATTR):
+            # reads the descriptors cannot record (dunders such as __slots__,
+            # enum members, descriptors): every user of the class family
+            out |= family_tests(key, sub)
     for mod, name in diff["globals"]:
         out |= global_ref_tests(mod, name)
+    # import-time edits the fingerprints could not see: fall back to everything
+    # that refers to the names those statements bind
+    seen_mods = {k.partition(":")[0] for k, _ in diff["attrs"]} | {m for m, _ in diff["globals"]}
+    for rel, ch in plan.py_changes.items():
+        if not (rel.startswith("sqlglot/") and ch.semantic and ch.import_time) or ch.syntax_error:
+            continue
+        mod = module_of(rel)
+        if seen_mods & importer_closure({mod}):
+            continue
+        for name in ch.toplevel_names:
+            out |= global_ref_tests(mod, name)
+        for q in ch.class_quals:
+            key = f"{mod}:{q}"
+            sub = subtree(key)
+            names = ch.toplevel_names or set()
+            hit = False
+            for name in names:
+                for x in LK_BY_ATTR.get(name, ()):
+                    if x in sub:
+                        out.update(SETS[LK[f"{x}|{name}"]])
+                        hit = True
+                meth = method_lines(key, name, pristine, patched)
+                if meth is not None:
+                    out |= meth
+                    hit = True
+            if not hit:
+                out |= family_tests(key, sub)
     return out, False
+
+
+def family_tests(key: str, sub: set) -> set:
+    """Every test that read anything through the class or a subclass; for
+    classes nobody reads through (enums), everything referring to the class."""
+    out: set = set()
+    for x in sub:
+        sid = CLASSUSE.get(x)
+        if sid is not None:
+            out.update(SETS[sid])
+    if not out:
+        mod, _, qual = key.partition(":")
+        out |= global_ref_tests(mod, qual.split(".")[0])
+    return out
 
 
 def method_lines(key: str, attr: str, pristine: dict, patched: dict):
@@ -647,7 +753,7 @@ def run_tests(nums: list[int]) -> tuple[set, set]:
     loader = unittest.TestLoader()
     id2num = {}
     by_class: dict = {}
-    for n in nums:
+    for n in sorted(nums):  # collection order, as pytest runs them
         tid = next(t["id"] for t in [TESTS_BY_NUM[n]])
         parts = tid.split("::")
         mod = FILE_OF[n][:-3].replace("/", ".")
@@ -802,6 +908,9 @@ def main() -> None:
     outputs: dict[str, dict] = {}
     max_par = int(os.environ.get("BR_PAR", "2"))
     queue = list(jobs)
+    # hard wall-clock watchdog: the whole batch must finish inside the limit
+    hard = float(os.environ.get("BR_HARD", 0)) or (168.0 if n <= 45 else 258.0) * max(1.0, n / (40 if n <= 45 else 60))
+    child_limit = float(os.environ.get("BR_CHILD_LIMIT", "45"))
     while queue or running:
         while queue and len(running) < max_par and time.time() - T0 < budget:
             cid = queue.pop(0)
@@ -810,6 +919,7 @@ def main() -> None:
             if pid == 0:
                 os.close(r)
                 try:
+                    os.setpgid(0, 0)  # own process group: the watchdog kills it whole
                     child_main(plans[cid], w)
                 finally:
                     os._exit(0)
@@ -817,7 +927,27 @@ def main() -> None:
             running[pid] = (cid, r, time.time())
         if not running:
             break
-        pid, _status = os.waitpid(-1, 0)
+        pid, _status = os.waitpid(-1, os.WNOHANG)
+        if pid == 0:
+            now = time.time()
+            for cpid, (ccid, cr, cst) in list(running.items()):
+                if now - cst > child_limit or now - T0 > hard:
+                    try:
+                        os.killpg(cpid, signal.SIGKILL)
+                    except OSError:
+                        try:
+                            os.kill(cpid, signal.SIGKILL)
+                        except OSError:
+                            pass
+                    try:
+                        os.waitpid(cpid, 0)
+                    except ChildProcessError:
+                        pass
+                    os.close(cr)
+                    running.pop(cpid, None)
+                    outputs[ccid] = {"error": f"killed after {now - cst:.1f}s"}
+            time.sleep(0.01)
+            continue
         if pid not in running:
             continue
         cid, r, st = running.pop(pid)

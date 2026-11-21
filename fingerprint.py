@@ -12,8 +12,13 @@ from __future__ import annotations
 
 import enum
 import functools
+import collections
+import datetime
+import decimal
+import fractions
 import hashlib
 import logging
+import re
 import importlib
 import os
 import pkgutil
@@ -21,6 +26,7 @@ import sys
 import types
 
 _SIMPLE = (type(None), bool, int, float, complex, str, bytes)
+_VALUE_TYPES = (datetime.date, datetime.time, datetime.timedelta, datetime.tzinfo, decimal.Decimal, fractions.Fraction, range, slice)
 _FUNC_TYPES = (types.FunctionType, types.BuiltinFunctionType, types.MethodType, types.BuiltinMethodType)
 
 
@@ -38,6 +44,15 @@ def _fp(v, depth: int, seen: set) -> str:
         return f"LOG:{type(v).__name__}:{getattr(v, 'name', '')}"
     if t.__module__ in ("threading", "_thread", "weakref", "_weakref", "_weakrefset"):
         return f"T:{t.__qualname__}"
+    if isinstance(v, re.Pattern):
+        return f"RE:{v.pattern!r}:{v.flags}"
+    if isinstance(v, _VALUE_TYPES):
+        return f"V:{t.__qualname__}:{v!r}"
+    if hasattr(t, "arg_types") and hasattr(v, "args") and t.__module__.startswith("sqlglot"):
+        try:  # sqlglot expression trees: depth-independent
+            return f"X:{t.__qualname__}:{v!r}"
+        except Exception:  # noqa: BLE001
+            pass
     if depth <= 0:
         return f"T:{t.__qualname__}"
     vid = id(v)
@@ -89,6 +104,15 @@ def _fp(v, depth: int, seen: set) -> str:
         d = getattr(v, "__dict__", None)
         slots = getattr(t, "__slots__", None)
         parts = [f"O:{t.__module__}.{t.__qualname__}"]
+        if isinstance(v, collections.defaultdict):
+            parts.append(_fp(v.default_factory, depth - 1, seen))
+        if not isinstance(d, dict) and not slots:
+            try:
+                r = repr(v)
+                if " at 0x" not in r:
+                    parts.append(r[:2000])
+            except Exception:  # noqa: BLE001
+                pass
         if isinstance(d, dict):
             parts.append(_fp(d, depth - 1, seen))
         if slots:
@@ -242,7 +266,7 @@ def diff(a: dict, b: dict, only: set | None = None) -> dict:
     for key in {k for k in a["classes"] if keep(k)} | {k for k in b["classes"] if keep(k)}:
         ca = a["classes"].get(key)
         cb = b["classes"].get(key)
-        if ca is None or cb is None:
+        if ca is None or cb is None or a["bases"].get(key) != b["bases"].get(key):
             changed_attrs.append((key, "*"))
             continue
         for name in set(ca) | set(cb):
