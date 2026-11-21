@@ -1329,8 +1329,9 @@ def fresh_member(key: str, attr: str, plan: Plan, pristine: dict) -> bool:
 
 
 def dispatch_member_tests(key: str, attr: str, plan: Plan, pristine: dict, sub: set) -> set | None:
-    """Tests a new public generator method X_sql can reach, when its name
-    appears nowhere else (as for fresh_member). The generator finds such a
+    """Tests a new public generator method X_sql can reach, when nothing
+    calls it by name (every mention is a def header) and no ancestor or
+    mixin had it. The generator finds such a
     method only by name: its dispatch table (built from dir(cls), keyed by
     the class exp.EXPR_CLASSES[X]) and lookups of node.key + "_sql". Before
     the patch, a node of that class with no handler went to
@@ -1341,9 +1342,25 @@ def dispatch_member_tests(key: str, attr: str, plan: Plan, pristine: dict, sub: 
     rule does not apply."""
     if not attr.endswith("_sql") or attr.startswith("_"):
         return None
-    cls = _fresh_class(key, attr, plan, pristine)
+    cls = _member_class(key, attr, pristine)
     if cls is None:
         return None
+    # no ancestor had it, and nothing names it but def headers (other
+    # generators' own X_sql): it is found only by the lookups below
+    if any(attr in k.__dict__ for k in cls.__mro__[1:]) or not _only_defs(attr, plan.files.values()):
+        return None
+    # and every subclass now resolves it to this method or its own override
+    # (not to a mixin's, which had been its handler before)
+    stack, seen = list(cls.__subclasses__()), set()
+    while stack:
+        sc = stack.pop()
+        if sc in seen:
+            continue
+        seen.add(sc)
+        stack.extend(sc.__subclasses__())
+        owner = next((k for k in sc.__mro__ if attr in k.__dict__), None)
+        if owner is not cls and not (isinstance(owner, type) and issubclass(owner, cls)):
+            return None
     try:
         from sqlglot import exp
         from sqlglot.generator import Generator
@@ -1382,6 +1399,47 @@ def _fresh_class(key: str, attr: str, plan: Plan, pristine: dict):
     class whose MRO is all sqlglot code; else None."""
     import re
 
+    cls = _member_class(key, attr, pristine)
+    if cls is None:
+        return None
+    pat = re.compile(r"(?<![A-Za-z0-9_])" + re.escape(attr) + r"(?![A-Za-z0-9_])")
+    if sum(len(pat.findall(t)) for t in plan.files.values() if t) != 1:
+        return None
+    return None if _mentions(attr, []) else cls
+
+
+def _only_defs(word: str, texts) -> bool:
+    """Whether every whole-word occurrence of word, in texts and in the files
+    of the pristine checkout a test run can import or read, is a def header."""
+    import re
+
+    pat = re.compile(r"(?<![A-Za-z0-9_])" + re.escape(word) + r"(?![A-Za-z0-9_])")
+    dpat = re.compile(r"(?<![A-Za-z0-9_])def[ \t]+" + re.escape(word) + r"[ \t]*\(")
+    for t in texts:
+        if t is not None and len(pat.findall(t)) != len(dpat.findall(t)):
+            return False
+    w = word.encode()
+    bpat = re.compile(pat.pattern.encode())
+    bdpat = re.compile(dpat.pattern.encode())
+    for dp, dns, fns in os.walk(PRISTINE):
+        dns[:] = [d for d in dns if d not in (".git", "__pycache__") and not (dp == PRISTINE and d in _NOT_RUN)]
+        for fn in fns:
+            if dp == PRISTINE and fn.endswith((".md", ".png")):
+                continue
+            try:
+                with open(os.path.join(dp, fn), "rb") as fh:
+                    data = fh.read()
+            except OSError:
+                return False
+            if w in data and len(bpat.findall(data)) != len(bdpat.findall(data)):
+                return False
+    return True
+
+
+def _member_class(key: str, attr: str, pristine: dict):
+    """The live class, when attr is a member the patch adds to a class whose
+    MRO is all sqlglot code (no Enum, dataclass, NamedTuple or Protocol, no
+    foreign metaclass); else None."""
     if attr.startswith("__") or (attr.startswith("_") and attr.endswith("_")) or not attr.isidentifier():
         return None
     pc = (pristine.get("classes") or {}).get(key)
@@ -1407,10 +1465,7 @@ def _fresh_class(key: str, attr: str, plan: Plan, pristine: dict):
             continue
         if not (getattr(k, "__module__", "") or "").startswith("sqlglot"):
             return None
-    pat = re.compile(r"(?<![A-Za-z0-9_])" + re.escape(attr) + r"(?![A-Za-z0-9_])")
-    if sum(len(pat.findall(t)) for t in plan.files.values() if t) != 1:
-        return None
-    return None if _mentions(attr, []) else cls
+    return cls
 
 
 def family_tests(key: str, sub: set) -> set:

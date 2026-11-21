@@ -43,12 +43,15 @@ them across workers.
      and only once in the patched files is read by nothing, when the class's
      whole MRO is sqlglot code (no Enum, dataclass, NamedTuple or Protocol)
      and the name is not dunder, `_sunder_` or `*_sql`. A new public `X_sql`
-     method on a generator, under such a name, is reached only through the
-     generator's dispatch (keyed by the expression class `X`) or a
-     `node.key + "_sql"` lookup. Before the patch, a node of class `X` (a
-     function, which falls back to `function_fallback_sql`) had its class's
-     `arg_types` read. So such a method charges only the tests that read
-     something through class `X` and used that generator family.
+     method on a generator is reached only through the generator's dispatch
+     (keyed by the expression class `X`) or a `node.key + "_sql"` lookup.
+     That holds when no ancestor defines the name, every subclass resolves it
+     to the new method or its own override, and every mention of the name in
+     sqlglot and the tests is a `def` header (other generators' own
+     methods). Before the patch, a node of class `X` (a function, which fell
+     back to `function_fallback_sql`) had its class's `arg_types` read. So
+     such a method charges only the tests that read something through class
+     `X` and used that generator family.
    - *New modules nothing imports.* Python imports a module only by its name,
      and every dynamic import in sqlglot and its tests builds that name from
      text found somewhere (a dialect string, an attribute name, a fixed
