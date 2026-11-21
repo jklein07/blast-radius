@@ -742,6 +742,31 @@ def _mentions(word: str, texts, exclude=(), runtime_only: bool = False) -> bool:
     return False
 
 
+_INTROSPECTED = None
+
+
+def introspected(rel: str) -> bool:
+    """Whether rel lies in a folder that a test lists and whose test file reads
+    code objects (test_typing compares the annotators of the sqlglot/typing
+    modules by co_code, co_names and co_varnames): there, renaming a name
+    can change a test's outcome."""
+    global _INTROSPECTED
+    if _INTROSPECTED is None:
+        _INTROSPECTED = set()
+        for d, sid in DIRREADS.items():
+            for f in {FILE_OF[n] for n in SETS[sid] if n in FILE_OF}:
+                src = read_pristine(f) or ""
+                if "__code__" in src or "co_code" in src or "co_names" in src or "co_varnames" in src:
+                    _INTROSPECTED.add(d)
+    d = os.path.dirname(rel)
+    while True:
+        if d in _INTROSPECTED:
+            return True
+        if not d:
+            return False
+        d = os.path.dirname(d)
+
+
 def patched_texts(fps) -> dict:
     """New text of every file the patch leaves (None when unreadable)."""
     out = {}
@@ -845,7 +870,7 @@ def analyze(cid: str, text: str) -> Plan:
             plan.cands.add(tests_reading(r, listing), P_CODE if r.endswith(".py") else P_DATA)
         if path.endswith(".py") and (path.startswith("sqlglot/") or path.startswith("tests/")):
             oc, nc = fp.changed_lines() if (old is not None and new is not None and not fp.is_new) else (None, None)
-            ch = astdiff.analyze(old, new, oc, nc)
+            ch = astdiff.analyze(old, new, oc, nc, renames=not introspected(path))
             if ch.global_renames and not fp.is_new and old_rel == new_rel and path.startswith("sqlglot/"):
                 texts = [t for r, t in patched_texts(fps).items() if r != path]
                 if any(_mentions(w, texts, (path,), True) for pair in ch.global_renames for w in pair):

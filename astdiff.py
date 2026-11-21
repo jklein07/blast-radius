@@ -76,8 +76,9 @@ def _span(x):
 
 
 class _Walker:
-    def __init__(self, change: PyChange, old_lines=None, new_lines=None, old_src=None, new_src=None):
+    def __init__(self, change: PyChange, old_lines=None, new_lines=None, old_src=None, new_src=None, alpha: bool = True):
         self.c = change
+        self.alpha = alpha
         self.ol = old_lines
         self.nl = new_lines
         self._swap = None
@@ -133,7 +134,7 @@ class _Walker:
                 hdr_a = [getattr(a, f, None) for f in ("args", "decorator_list", "returns", "name", "type_params")]
                 hdr_b = [getattr(b, f, None) for f in ("args", "decorator_list", "returns", "name", "type_params")]
                 hdr_same = all(_dump_any(x) == _dump_any(y) for x, y in zip(hdr_a, hdr_b))
-                if hdr_same and _alpha_equal(a, b) and self._same_code(a, b):
+                if hdr_same and self.alpha and _alpha_equal(a, b) and self._same_code(a, b):
                     return  # the same code with its local variables renamed
                 if not hdr_same:
                     self.report_def(a, ctx)
@@ -831,7 +832,9 @@ def _global_renames(a, b) -> list:
 
 
 def analyze(old_src: str | None, new_src: str | None, old_changed=None, new_changed=None, renames: bool = True) -> PyChange:
-    """old_changed/new_changed are accepted for compatibility and unused."""
+    """old_changed/new_changed are accepted for compatibility and unused.
+    renames=False: no rename counts as no change (for code a test inspects:
+    renaming changes co_names / co_varnames)."""
     c = PyChange()
     try:
         a = ast.parse(old_src or "")
@@ -875,7 +878,7 @@ def analyze(old_src: str | None, new_src: str | None, old_changed=None, new_chan
     skip = _permuted_imports(a.body, b.body)
     ba = [x for i, x in enumerate(a.body) if i not in skip]
     bb = [x for i, x in enumerate(b.body) if i not in skip]
-    _Walker(c, (old_src or "").split("\n"), (new_src or "").split("\n"), old_src, new_src).seq(ba, bb, (a,), None, a)
+    _Walker(c, (old_src or "").split("\n"), (new_src or "").split("\n"), old_src, new_src, renames).seq(ba, bb, (a,), None, a)
     c.semantic = bool(c.runtime_lines or c.import_time or c.def_changes or c.import_lines)
     return c
 

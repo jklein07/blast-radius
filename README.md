@@ -28,7 +28,10 @@ them across workers.
      unchanged when neither name appears in any other file a test run can
      import or read, nothing in the file reads names by string or through
      `globals()`/`vars()`, and (for a function) every use is a direct call,
-     so nothing can see its `__name__`.
+     so nothing can see its `__name__`. Neither this nor the renamed-locals
+     rule applies in a folder whose listing test reads code objects
+     (`test_typing` compares the `sqlglot/typing` annotators by `co_names`
+     and `co_varnames`).
    - *New modules nothing imports.* Python imports a module only by its name,
      and every dynamic import in sqlglot and its tests builds that name from
      text found somewhere (a dialect string, an attribute name, a fixed
