@@ -201,6 +201,9 @@ them across workers.
    import.
 8. **Pack.** The final set goes onto 1–8 workers (longest first), choosing
    the worker count that minimises busiest-worker time + 2 s per worker.
+   Once every line is printed and every child reaped, the process exits
+   without the interpreter's teardown (freeing every module and object costs
+   CPU and changes nothing in the output).
 
 When anything is uncertain (unparseable patch, import failure, pytest
 configuration change, child error or time budget), it falls back to a safe

@@ -3033,3 +3033,12 @@ def _main(st: dict) -> None:
 
 if __name__ == "__main__":
     main()
+    if os.environ.get("BR_FASTEXIT", "1") == "1":
+        # Every line is written and every child reaped: skip the interpreter's
+        # teardown (freeing every module and object, numpy, pandas and duckdb
+        # included), CPU that changes nothing in the output.
+        try:
+            sys.stdout.flush()
+            sys.stderr.flush()
+        finally:
+            os._exit(0)
