@@ -298,8 +298,26 @@ def vcost(n: int) -> float:
     return max(0.0, c - CLASS_SETUP.get(_cls(n), 0.0)) + 0.002
 
 
+# With xcache.bin, TestExecutor's class set-up loads stored rows instead of
+# parsing the TPC tables (xsetup.py): a small part of the measured cost. Used
+# for a commit only when the child will take that path (XS_ON, xs_files_ok).
+XS_CLS = "tests/test_executor.py::TestExecutor"
+XS_FRAC = float(os.environ.get("BR_XS_FRAC", "0.15"))
+XS_ON: list = [False]
+
+
+def xs_files_ok(files) -> bool:
+    """From the patch alone: will a child use the stored TPC rows?"""
+    import xsetup
+
+    return XFAST and xsetup.plan_ok(files)
+
+
 def setup_cost(n: int) -> float:
-    return CLASS_SETUP.get(_cls(n), 0.0) if n in VCPU else 0.0
+    c = CLASS_SETUP.get(_cls(n), 0.0) if n in VCPU else 0.0
+    if XS_ON[0] and _cls(n) == XS_CLS:
+        c *= XS_FRAC
+    return c
 LK_BY_ATTR: dict[str, list[str]] = {}
 for k in LK:
     cls, _, attr = k.rpartition("|")
@@ -2768,6 +2786,7 @@ def child_main(plan: Plan, wfd: int) -> None:
                     split[n] = (sm["attr"], list(range(nq)), nq, round(0.3 + sum(fe["cpu"].values()), 3), "fe")
             if getattr(plan, "import_errors", None):
                 split = {n: v for n, v in split.items() if v[4] != "fe"}
+            XS_ON[0] = xs_files_ok(plan.files)
             verify, include = choose_verify(cands, True, split)
             vsplit = {n: v for n, v in split.items() if n in verify}
             vfe = {n: v for n, v in vsplit.items() if v[4] == "fe"}
@@ -2927,6 +2946,7 @@ def _main(st: dict) -> None:
         elif not p.cands:
             selections[cid] = []
         else:
+            XS_ON[0] = xs_files_ok(p.files)
             verify, include = choose_verify(p.cands, False, {n: v for n, v in p.split.items()})
             if not verify:
                 selections[cid] = include

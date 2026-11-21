@@ -197,6 +197,7 @@ them across workers.
    identical class state). A child uses them only when every one of those
    files in its tree is the pinned one; it still builds each `Table` with
    the patched class, and opens the duckdb views at first use.
+   The cost model then prices that class setup at 15% of its measured cost.
    Importing the patched code has a CPU-time limit: 5 s for sqlglot (the
    snapshot; the slowest normal case takes 1.2 s) and 8 s for the test
    modules before verifying. Some modules parse SQL while they import,

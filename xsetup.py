@@ -42,6 +42,15 @@ def load(path: str):
     return _DATA
 
 
+def plan_ok(files) -> bool:
+    """From the patch alone: may the stored rows stand in for the parse?
+    (tree_ok decides in the child; this is the parent's estimate of it.)"""
+    for rel in files:
+        if rel in DEPS or rel.endswith(".csv.gz") or ("/" not in rel and rel.endswith(".py")):
+            return False  # (a top-level module could shadow csv, gzip or ast)
+    return True
+
+
 def tree_ok(root: str, pristine: str, data: dict) -> bool:
     """In the child's tree: every file the rows depend on is the pinned one."""
     rp = os.path.realpath(pristine)
