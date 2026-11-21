@@ -122,7 +122,10 @@ them across workers.
 7. **Verify cheap candidates.** Candidates that cost little to run are run on
    a symlink copy of the patched tree in a forked child, and kept only if they
    fail. Expensive ones are kept unverified when that is cheaper. The cost
-   model uses each test's measured CPU and its class setup. Every verified
+   model uses each test's measured CPU and its class setup, and a prior
+   chance that a candidate fails (one constant per kind of reason it was
+   chosen: 0.2 for code and import-time state, 0.5 for test-side changes,
+   0.9 for data files). Every verified
    test runs under its own timer (three times its measured cost plus a
    margin; 15 s for class setup); a test that runs out of time is kept,
    because a patch that makes a test hang makes it fail.

@@ -33,6 +33,8 @@ _FUNC_TYPES = (types.FunctionType, types.BuiltinFunctionType, types.MethodType, 
 _LOG_TYPES = (logging.Logger, logging.LoggerAdapter, logging.Handler, logging.Filter)
 _THREAD_MODS = ("threading", "_thread", "weakref", "_weakref", "_weakrefset")
 _KIND: dict = {}  # type -> which leaf rule applies to its instances (0: none)
+_MEMO: dict = {}  # (id, depth) -> (object, string) for subtrees with no cycle marker
+_CYC = [0]
 _LEAF: dict = {}  # id -> (object, string) for enum members and classes (the object is held, so its id stays unique)
 
 
@@ -97,9 +99,21 @@ def _fp(v, depth: int, seen: set) -> str:
     if depth <= 0:
         return f"T:{t.__qualname__}"
     vid = id(v)
+    hit = _MEMO.get((vid, depth))
+    if hit is not None and hit[0] is v:
+        return hit[1]
     if vid in seen:
+        _CYC[0] += 1
         return "@cycle"
     seen.add(vid)
+    c0 = _CYC[0]
+    r = _expand(v, t, depth, seen, vid)
+    if _CYC[0] == c0:
+        _MEMO[(vid, depth)] = (v, r)
+    return r
+
+
+def _expand(v, t, depth: int, seen: set, vid: int) -> str:
     try:
         if isinstance(v, (types.FunctionType,)):
             parts = [f"F:{v.__module__}.{v.__qualname__}"]
