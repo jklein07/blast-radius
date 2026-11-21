@@ -2170,6 +2170,17 @@ def run_tests(nums: list[int], split: dict | None = None) -> tuple[set, set]:
     limits = {uid: 3.0 * SEC[n] + 1.5 for uid, n in id2num.items()}
 
     class R(unittest.TestResult):
+        # A test has failed once one of its subtests fails, so the rest of
+        # it can only cost time: with failfast, subTest() ends the test at
+        # its first failing subtest. stop() is a no-op so that failfast
+        # never ends the suite: the class's other tests still run.
+        def __init__(self):
+            super().__init__()
+            self.failfast = True
+
+        def stop(self):
+            pass
+
         def startTest(self, test):
             super().startTest(test)
             signal.setitimer(signal.ITIMER_REAL, limits.get(test.id(), 5.0))

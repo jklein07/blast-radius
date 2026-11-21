@@ -144,7 +144,9 @@ them across workers.
    0.9 for data files). Every verified
    test runs under its own timer (three times its measured cost plus a
    margin; 15 s for class setup); a test that runs out of time is kept,
-   because a patch that makes a test hang makes it fail. A patch can also
+   because a patch that makes a test hang makes it fail. A test stops at
+   its first failing subtest: it has failed, and the rest would only cost
+   time. A patch can also
    make a test allocate without end, faster than any timer: a thread in each
    child stops it once it holds 1.3 GB more than at the fork (address space
    is capped too, far above that), and that commit keeps every candidate, so
