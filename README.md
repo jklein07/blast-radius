@@ -38,6 +38,11 @@ them across workers.
      on by name), every use is its def or an attribute load on `self`, `cls`
      or `super()`, the classes that define it have only sqlglot bases, and
      neither name appears in any other file.
+   - *New class members nothing names.* A member the patch adds to a class
+     (a constant or a method) under a name that appears in no pristine file
+     and only once in the patched files is read by nothing, when the class's
+     whole MRO is sqlglot code (no Enum, dataclass, NamedTuple or Protocol)
+     and the name is not dunder, `_sunder_` or `*_sql`.
    - *New modules nothing imports.* Python imports a module only by its name,
      and every dynamic import in sqlglot and its tests builds that name from
      text found somewhere (a dialect string, an attribute name, a fixed

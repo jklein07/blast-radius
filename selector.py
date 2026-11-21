@@ -1229,6 +1229,8 @@ def snapshot_candidates(pristine: dict, patched: dict, diff: dict, plan: Plan) -
     for key, attr in diff["attrs"]:
         if attr == "__doc__":
             continue  # docstrings: nothing reads them at runtime
+        if fresh_member(key, attr, plan, pristine):
+            continue  # a new member under a name nothing mentions
         if f"{key}|{attr}" in KLTAGS:
             if live is None:
                 import fingerprint
@@ -1305,6 +1307,49 @@ def snapshot_candidates(pristine: dict, patched: dict, diff: dict, plan: Plan) -
             if not hit:
                 out |= family_tests(key, sub)
     return out, False
+
+
+_LIVE: dict = {}
+
+
+def fresh_member(key: str, attr: str, plan: Plan, pristine: dict) -> bool:
+    """A class member the patch adds under a name that appears nowhere else:
+    not in any pristine file and only once (its own definition) in the
+    patched files. Nothing can read it by name, and on a class whose whole
+    MRO is sqlglot code (no Enum, dataclass, NamedTuple or Protocol, no
+    foreign metaclass) nothing enumerates members generically, except the
+    generator's dispatch on public *_sql methods."""
+    import re
+
+    if attr.startswith("__") or (attr.startswith("_") and attr.endswith("_")) or attr.endswith("_sql") or not attr.isidentifier():
+        return False
+    pc = (pristine.get("classes") or {}).get(key)
+    if pc is None or attr in pc:
+        return False
+    if not _LIVE:
+        import fingerprint
+
+        _LIVE.update(dict(fingerprint.iter_classes(sorted(sys.modules), "sqlglot")))
+    cls = _LIVE.get(key)
+    if not isinstance(cls, type):
+        return False
+    import dataclasses
+    import typing
+
+    if dataclasses.is_dataclass(cls):
+        return False
+    meta = type(cls)
+    if meta is not type and not (getattr(meta, "__module__", "") or "").startswith("sqlglot"):
+        return False
+    for k in cls.__mro__:
+        if k is object or k is typing.Generic:
+            continue
+        if not (getattr(k, "__module__", "") or "").startswith("sqlglot"):
+            return False
+    pat = re.compile(r"(?<![A-Za-z0-9_])" + re.escape(attr) + r"(?![A-Za-z0-9_])")
+    if sum(len(pat.findall(t)) for t in plan.files.values() if t) != 1:
+        return False
+    return not _mentions(attr, [])
 
 
 def family_tests(key: str, sub: set) -> set:
