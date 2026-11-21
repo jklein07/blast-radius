@@ -24,13 +24,29 @@ them across workers.
    that attribute through the class or a subclass. The tracer records those
    reads by wrapping every class attribute in a recording descriptor. Each
    changed global maps to the tests that execute a line referring to it.
-4. **Data files → file reads.** SQL fixtures and other files map to the tests
+4. **Operator swaps → value profile.** When the only difference in a
+   comparison is its operator (`is` for `==`, `<` for `<=`, `is not` for `!=`,
+   ...), executing the line is not enough to change anything: the new
+   operator must also give a different result on the same operands. Until
+   that first different result, the patched program runs exactly like the
+   original. `wmtrace.py` imports sqlglot with every one-operator comparison
+   rewritten to also evaluate the alternative operators. It runs each test in
+   its own process and records, per comparison site, which alternatives ever
+   gave a different result (or raised differently) in that test. A swap is
+   charged only to those tests. Line coverage still applies to tests whose
+   instrumented run cannot be trusted, and to sites the profile does not
+   cover. The profile is the union of a native run and an amd64 run.
+5. **Query-level verification for the TPC tests.** `test_execute_tpcds`
+   and its TPC-H siblings loop over a fixture's queries. `qtrace.py` records
+   which queries execute each line. When a change reaches only some of them,
+   the test can be verified on those queries alone.
+6. **Data files → file reads.** SQL fixtures and other files map to the tests
    that opened them (or whose module opened them while importing).
-5. **Verify cheap candidates.** Candidates that cost little to run are run on
+7. **Verify cheap candidates.** Candidates that cost little to run are run on
    a symlink copy of the patched tree in a forked child, and kept only if they
    fail. Expensive ones are kept unverified when that is cheaper. The cost
    model uses each test's measured CPU and its class setup.
-6. **Pack.** The final set goes onto 1–8 workers (longest first), choosing
+8. **Pack.** The final set goes onto 1–8 workers (longest first), choosing
    the worker count that minimises busiest-worker time + 2 s per worker.
 
 When anything is uncertain (unparseable patch, import failure, pytest
@@ -52,6 +68,8 @@ references).
 | `patchapply.py` | Unified-diff parser and applier (stdlib only) |
 | `inline.py` | In-process ProcessPoolExecutor with pickle round trips |
 | `tracer.py`, `modlines.py`, `build_maps.py`, `mksnap.py` | Build-time tools that produce `maps/maps.json.gz` and `snap.json` from the pinned commit |
+| `wmtrace.py`, `build_wm.py` | Build-time: comparison-swap profile, `maps/wm.json.gz` |
+| `qtrace.py`, `build_split.py` | Build-time: per-query coverage of the TPC tests, `maps/split.json.gz` |
 
 ## Rebuilding the maps
 
@@ -61,6 +79,10 @@ PYTHONHASHSEED=0 python tracer.py /opt/sqlglot tests.json out/trace 6
 TRACE_CALIB=1 PYTHONHASHSEED=0 python tracer.py /opt/sqlglot tests.json out/calib 2
 python modlines.py /opt/sqlglot tests.json out/modlines.json
 CALIB_DIR=out/calib python build_maps.py /opt/sqlglot tests.json out/trace out/modlines.json maps/maps.json.gz
+PYTHONHASHSEED=0 python wmtrace.py /opt/sqlglot tests.json out/wm 8
+python build_wm.py tests.json out/wm out/calib maps/wm.json.gz
+PYTHONHASHSEED=0 python qtrace.py /opt/sqlglot out/qtrace.json 4
+python build_split.py out/qtrace.json maps/split.json.gz
 ```
 
 ## Third-party code

@@ -34,6 +34,10 @@ class PyChange:
     class_quals: set = field(default_factory=set)  # qualnames of classes whose bodies changed at import level
     # one entry per runtime difference: (old lines, first line of enclosing function, its last line)
     runtime_groups: list = field(default_factory=list)
+    # runtime differences that only swap the operator of a one-operator
+    # comparison: (site "line:col:end_line:end_col", old op, new op, old lines, index in runtime_groups)
+    swaps: list = field(default_factory=list)
+    plain_lines: set = field(default_factory=set)  # runtime_lines from every other kind of difference
 
 
 def _first(fn) -> int:
@@ -71,6 +75,7 @@ class _Walker:
         self.c = change
         self.ol = old_lines
         self.nl = new_lines
+        self._swap = None
 
     def _key(self, x, lines):
         """Source text of an element (whole lines). Equal text means an equal
@@ -82,6 +87,16 @@ class _Walker:
 
     def node(self, a, b, ctx, stmt):
         if type(a) is not type(b):
+            cmp = ctx[-1] if ctx else None
+            if (isinstance(a, ast.cmpop) and isinstance(b, ast.cmpop) and isinstance(cmp, ast.Compare)
+                    and len(cmp.ops) == 1 and hasattr(cmp, "end_col_offset")):
+                key = f"{cmp.lineno}:{cmp.col_offset}:{cmp.end_lineno}:{cmp.end_col_offset}"
+                self._swap = (key, type(a).__name__, type(b).__name__)
+                try:
+                    self.report(a, ctx, stmt, None)
+                finally:
+                    self._swap = None
+                return
             self.report(a, ctx, stmt, None)
             return
         if isinstance(a, ast.AST):
@@ -169,6 +184,7 @@ class _Walker:
             self.report_def(n, ctx)
             lines = {-_first(n)} | _stmt_lines(n)
             self.c.runtime_lines |= lines
+            self.c.plain_lines |= lines
             self.c.import_time = True
             self._bind(n, ctx)
             return
@@ -204,6 +220,11 @@ class _Walker:
             self.c.runtime_lines |= lines
             fn_first = _first(fn)
             fn_last = getattr(fn, "end_lineno", None) or fn.lineno
+            if self._swap is not None and not insertion and fn_first not in (-l for l in lines):
+                key, old_op, new_op = self._swap
+                self.c.swaps.append((key, old_op, new_op, frozenset(lines), len(self.c.runtime_groups)))
+            else:
+                self.c.plain_lines |= lines
             self.c.runtime_groups.append((frozenset(lines), fn_first, fn_last))
             return
         # import-time difference
@@ -217,11 +238,14 @@ class _Walker:
     def report_def(self, fn, ctx):
         if isinstance(fn, ast.Lambda):
             self.c.runtime_lines |= {fn.lineno, -fn.lineno}
+            self.c.plain_lines |= {fn.lineno, -fn.lineno}
             return
         q = _qual(ctx, fn.name)
         self.c.def_changes.append((q, _first(fn), fn.end_lineno))
         self.c.runtime_lines.add(-_first(fn))
         self.c.runtime_lines |= _stmt_lines(fn)
+        self.c.plain_lines.add(-_first(fn))
+        self.c.plain_lines |= _stmt_lines(fn)
         self.c.import_time = True
         self.c.import_lines.add(fn.lineno)
         self._bind(fn, ctx)

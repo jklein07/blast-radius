@@ -291,6 +291,106 @@ def func_span_tests(path: str, first: int, last: int) -> set:
     return out
 
 
+# ------------------------------------------------- query-level verification
+# Tests that loop over the queries of a fixture which setUpClass loads into a
+# class attribute. maps/split.json.gz (qtrace.py) records which queries run
+# each line, so a change reaching only some queries is verified on those alone.
+SPLIT_IDS = (
+    "tests/test_executor.py::TestExecutor::test_execute_tpcds",
+    "tests/test_executor.py::TestExecutor::test_execute_tpch",
+    "tests/test_executor.py::TestExecutor::test_optimized_tpch",
+)
+SPLIT_NUMS = {NUM_BY_ID[t]: t for t in SPLIT_IDS if t in NUM_BY_ID}
+_SPLIT = None
+
+
+def split_maps() -> dict:
+    global _SPLIT
+    if _SPLIT is None:
+        try:
+            with gzip.open(os.path.join(os.path.dirname(MAPS), "split.json.gz"), "rt") as fh:
+                _SPLIT = json.load(fh)
+        except Exception:  # noqa: BLE001
+            _SPLIT = {}
+    return _SPLIT
+
+
+def split_queries(n: int, plan) -> tuple | None:
+    """(attr, query indexes, nq, CPU cost) when test n can be verified on only
+    the queries that execute a changed line; None when it must run whole."""
+    tid = SPLIT_NUMS.get(n)
+    if tid is None or n in plan.cands.other:
+        return None
+    sm_all = split_maps()
+    sm = sm_all.get("tests", {}).get(tid)
+    if not sm:
+        return None
+    setup = sm_all.get("setup", {})
+    tfile = FILE_OF[n]
+    q = 0
+    for rel, ch in plan.py_changes.items():
+        if not rel.startswith("sqlglot/") or not ch.semantic:
+            continue
+        old_src = read_pristine(rel)
+        if old_src is None:
+            continue  # a new module: reaches tests only through imports (snapshot)
+        if plan.files.get(rel, "") is None or ch.syntax_error:
+            return None
+        fm = COV.get(rel) or {}
+        ml = (MODLINES.get(tfile) or {}).get(rel)
+        if ml and any(l in ml for l in ch.runtime_lines):
+            return None
+        hit = set()
+        for l in ch.runtime_lines:
+            sid = fm.get(l)
+            if sid is not None and n in SETS[sid]:
+                hit.add(l)
+        spans = [(first, last) for _q, first, last in ch.def_changes]
+        exe = None
+        for lines, first, last in ch.runtime_groups:
+            if any(l in fm for l in lines):
+                continue
+            if exe is None:
+                exe = exec_lines(rel, old_src)
+            if exe is not None and any(l > 0 and l in exe for l in lines):
+                continue
+            if -first in fm:
+                if n in SETS[fm[-first]]:
+                    hit.add(-first)
+            else:
+                spans.append((first, last))
+        for first, last in spans:
+            for ln, sid in fm.items():
+                if first <= abs(ln) <= last and n in SETS[sid]:
+                    hit.add(ln)
+        su = set(setup.get(rel, ()))
+        lm = sm["lines"].get(rel, {})
+        for l in hit:
+            if l in su:
+                return None  # setUpClass runs it: every query depends on it
+            m = lm.get(str(l))
+            if m is None:
+                return None  # the whole test runs it but no single query does
+            q |= int(m, 16)
+    nq = sm["nq"]
+    if q == 0 or q == (1 << nq) - 1:
+        return None
+    idx = [i for i in range(nq) if q >> i & 1]
+    cost = sm["fixed"] + sum(sm["warm"][i] for i in idx) + max(sm["cold"][i] - sm["warm"][i] for i in idx)
+    return sm["attr"], idx, nq, round(cost, 3)
+
+
+def split_plan(plan, cands=None) -> dict:
+    cands = plan.cands if cands is None else cands
+    out = {}
+    for n in SPLIT_NUMS:
+        if n in cands and n not in cands.other:
+            r = split_queries(n, plan)
+            if r is not None:
+                out[n] = r
+    return out
+
+
 # ----------------------------------------------------------------- scheduling
 def schedule(nums) -> list[list[int]]:
     nums = sorted(set(nums), key=lambda n: (-MS[n], n))
@@ -319,7 +419,7 @@ def sched_cost_ms(nums) -> int:
     return max(sum(MS[n] for n in x) for x in b) + WORKER_MS * len(b)
 
 
-def choose_verify(cands: dict, already_forked: bool) -> tuple[list[int], list[int]]:
+def choose_verify(cands: dict, already_forked: bool, split: dict | None = None) -> tuple[list[int], list[int]]:
     """Split candidates into (verify, include) minimising expected cost.
 
     Verifying test i costs its CPU; it removes i from the schedule only if it
@@ -328,14 +428,18 @@ def choose_verify(cands: dict, already_forked: bool) -> tuple[list[int], list[in
     """
     if not VERIFY:
         return [], sorted(cands)
-    fixed = sorted(n for n in cands if n in NOVERIFY)
-    free = [n for n in cands if n not in NOVERIFY]
+    split = split or {}
+    fixed = sorted(n for n in cands if n in NOVERIFY and n not in split)
+    free = [n for n in cands if n not in NOVERIFY or n in split]
     if not free:
         return [], fixed
     ovh = 0.0 if already_forked else CHILD_OVH
 
+    def vc(n):
+        return split[n][3] if n in split else vcost(n)
+
     def key(n):
-        return ((vcost(n) + setup_cost(n)) / max(1e-3, 1.0 - cands[n]), n)
+        return ((vc(n) + setup_cost(n)) / max(1e-3, 1.0 - cands[n]), n)
 
     free.sort(key=key)
     m = len(free)
@@ -349,7 +453,7 @@ def choose_verify(cands: dict, already_forked: bool) -> tuple[list[int], list[in
         if k_ not in seen_cls:
             seen_cls.add(k_)
             extra = setup_cost(n)
-        prefix.append(prefix[-1] + vcost(n) + extra)
+        prefix.append(prefix[-1] + vc(n) + extra)
         pnone.append(pnone[-1] * (1.0 - cands[n]))
     best = None
     for k in ks:
@@ -367,10 +471,20 @@ def choose_verify(cands: dict, already_forked: bool) -> tuple[list[int], list[in
 
 # ------------------------------------------------------------------- analysis
 class Cands(dict):
-    """test number -> prior probability that it fails."""
+    """test number -> prior probability that it fails.
 
-    def add(self, nums, p: float) -> None:
+    `other` holds the tests added for any reason except executing a changed
+    sqlglot line (rt=True); only those can be split into their queries."""
+
+    def __init__(self, *a, **k):
+        super().__init__(*a, **k)
+        src = a[0] if a else None
+        self.other = set(getattr(src, "other", ()))
+
+    def add(self, nums, p: float, rt: bool = False) -> None:
         for n in nums:
+            if not rt:
+                self.other.add(n)
             if self.get(n, -1.0) < p:
                 self[n] = p
 
@@ -384,6 +498,7 @@ class Plan:
         self.files: dict[str, str | None] = {}  # rel path -> new text (None = deleted)
         self.py_changes: dict[str, astdiff.PyChange] = {}
         self.notes: list[str] = []
+        self.split: dict = {}  # test -> (attr, queries, nq, cost) for query-level verification
 
 
 def read_pristine(rel: str) -> str | None:
@@ -508,13 +623,76 @@ def exec_lines(rel: str, src: str | None) -> set:
     return v
 
 
+_WM = None
+
+
+def wm_maps() -> dict:
+    global _WM
+    if _WM is None:
+        try:
+            with gzip.open(os.path.join(os.path.dirname(MAPS), "wm.json.gz"), "rt") as fh:
+                _WM = json.load(fh)
+            nums = [NUM_BY_ID.get(i) for i in _WM["tests"]]
+            _WM["_nums"] = nums
+            _WM["_incomplete"] = {nums[i] for i in _WM["incomplete"] if nums[i] is not None}
+            # tests of this run the profile never saw count as incomplete
+            _WM["_incomplete"] |= set(ALL) - {n for n in nums if n is not None}
+        except Exception:  # noqa: BLE001
+            _WM = {}
+    return _WM
+
+
+def _cov_only(rel: str, lines) -> set:
+    out: set = set()
+    fm = COV.get(rel) or {}
+    for ln in lines:
+        sid = fm.get(ln)
+        if sid is not None:
+            out.update(SETS[sid])
+    return out
+
+
+def wm_tests(rel: str, key: str, old_op: str, new_op: str, lines) -> set | None:
+    """Tests in which swapping this comparison's operator for new_op changes
+    a result at least once (wmtrace.py). None: no profile for the site."""
+    W = wm_maps()
+    if not W:
+        return None
+    site = W["sites"].get(rel, {}).get(key)
+    if site is None or site[0] != old_op:
+        return None
+    for d in W["modules"].values():  # the swap shows while a test module imports
+        if new_op in d.get(rel, {}).get(key, ()):
+            return None
+    out: set = set()
+    sid = site[1].get(new_op)
+    if sid is not None:
+        nums = W["_nums"]
+        out.update(nums[i] for i in W["sets"][sid] if nums[i] is not None)
+    out |= _cov_only(rel, lines) & W["_incomplete"]
+    return out
+
+
 def runtime_tests(rel: str, ch: astdiff.PyChange, old_src) -> set:
     """Tests that execute a runtime difference. When no line of a difference
     can fire a line event (a bare `if (` line, `nonlocal`, ...), blame its
-    whole function instead."""
-    out = cov_tests(rel, ch.runtime_lines)
+    whole function instead. An operator swap counts only for the tests in
+    which the new operator would give a different result."""
+    swaps = getattr(ch, "swaps", None) or []
+    swap_groups = set()
+    out: set = set()
+    for key, old_op, new_op, lines, gi in swaps:
+        t = wm_tests(rel, key, old_op, new_op, lines)
+        if t is None:
+            out |= cov_tests(rel, lines)
+        else:
+            out |= t
+            swap_groups.add(gi)
+    out |= cov_tests(rel, ch.plain_lines if swaps else ch.runtime_lines)
     fm = COV.get(rel) or {}
-    for lines, first, last in ch.runtime_groups:
+    for gi, (lines, first, last) in enumerate(ch.runtime_groups):
+        if gi in swap_groups:
+            continue
         if any(l in fm for l in lines):
             continue
         exe = exec_lines(rel, old_src)
@@ -533,13 +711,13 @@ def sqlglot_change(plan: Plan, rel: str, ch: astdiff.PyChange, old_src=None) -> 
         plan.need_snapshot = True  # the import error decides
         return
     if ch.runtime_lines:
-        plan.cands.add(runtime_tests(rel, ch, old_src), P_CODE)
+        plan.cands.add(runtime_tests(rel, ch, old_src), P_CODE, rt=True)
         # functions that also run while sqlglot is imported change import-time state
         imp = set(IMPORT_LINES.get(rel, ()))
         if any(l in imp for l in ch.runtime_lines if l > 0):
             plan.need_snapshot = True
     for q, first, last in ch.def_changes:
-        plan.cands.add(func_span_tests(rel, first, last), P_CODE)
+        plan.cands.add(func_span_tests(rel, first, last), P_CODE, rt=True)
     if ch.import_time:
         plan.need_snapshot = True
 
@@ -744,8 +922,35 @@ def _on_alarm(*_):
     raise _Timeout()
 
 
-def run_tests(nums: list[int]) -> tuple[set, set]:
-    """Run tests in this process. Returns (failing, unsure)."""
+def _apply_split(split: dict) -> None:
+    """Cut the query lists setUpClass loads down to the queries to verify."""
+    by_cls: dict = {}
+    for n, (attr, idx, nq, _c) in split.items():
+        parts = TESTS_BY_NUM[n]["id"].split("::")
+        mod = sys.modules.get(FILE_OF[n][:-3].replace("/", "."))
+        cls = getattr(mod, parts[1], None) if mod is not None and len(parts) > 2 else None
+        if cls is None:
+            continue  # runs whole
+        ent = by_cls.setdefault(cls, {}).setdefault(attr, [nq, set()])
+        ent[1].update(idx)
+    for cls, keep in by_cls.items():
+        orig = cls.__dict__.get("setUpClass")
+        if not isinstance(orig, classmethod):
+            continue
+
+        def su(c, _f0=orig.__func__, _keep=keep):
+            _f0(c)
+            for attr, (nq, idx) in _keep.items():
+                seq = getattr(c, attr, None)
+                if isinstance(seq, list) and len(seq) == nq:
+                    setattr(c, attr, [seq[i] for i in sorted(idx)])
+
+        cls.setUpClass = classmethod(su)
+
+
+def run_tests(nums: list[int], split: dict | None = None) -> tuple[set, set]:
+    """Run tests in this process. Returns (failing, unsure). Tests in `split`
+    run on the listed queries only."""
     import unittest
 
     failing: set = set()
@@ -784,6 +989,10 @@ def run_tests(nums: list[int]) -> tuple[set, set]:
     import inline
 
     inline.install()
+    if split and not any(n in SPLIT_NUMS and n not in split for n in nums):
+        # (a query-looping test that must run whole shares the class
+        # attribute, so cut nothing in that case)
+        _apply_split(split)
     for items, suite in suites:
         res = R()
         try:
@@ -833,8 +1042,12 @@ def child_main(plan: Plan, wfd: int) -> None:
             result["select"] = sorted(ALL)
             result["verified"] = 0
         else:
-            verify, include = choose_verify(cands, True)
-            failing, _ = run_tests(verify) if verify else (set(), set())
+            split = {n: v for n, v in plan.split.items() if n not in cands.other}
+            verify, include = choose_verify(cands, True, split)
+            vsplit = {n: v for n, v in split.items() if n in verify}
+            failing, _ = run_tests(verify, vsplit) if verify else (set(), set())
+            if vsplit:
+                result["split"] = {str(n): [len(v[1]), v[3], n in failing] for n, v in vsplit.items()}
             result["select"] = sorted(set(include) | failing)
             result["verified"] = len(verify)
             result["failing_verified"] = sorted(failing)
@@ -878,6 +1091,11 @@ def main() -> None:
     for cid, p in plans.items():
         if UNKNOWN and (p.cands or p.need_snapshot):
             p.cands.add(UNKNOWN, P_LOW)
+        try:
+            p.split = split_plan(p)
+        except Exception as e:  # noqa: BLE001
+            p.split = {}
+            p.notes.append(f"split error {e!r}")
         if p.all_tests:
             selections[cid] = list(ALL)
         elif p.need_snapshot:
@@ -885,7 +1103,7 @@ def main() -> None:
         elif not p.cands:
             selections[cid] = []
         else:
-            verify, include = choose_verify(p.cands, False)
+            verify, include = choose_verify(p.cands, False, {n: v for n, v in p.split.items()})
             if not verify:
                 selections[cid] = include
             else:
