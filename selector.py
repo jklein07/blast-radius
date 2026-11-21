@@ -883,6 +883,12 @@ def build_farm(cid: str, files: dict) -> str:
     """A tree that looks like the patched checkout: symlinks to the pristine
     files, real files only where the patch changed something."""
     root = os.path.join(TMP, "w", cid)
+    if os.path.lexists(root):
+        # a leftover tree may hold a symlink where this patch needs a real
+        # directory; writing through it would change the pristine checkout
+        import shutil
+
+        shutil.rmtree(root, ignore_errors=True)
     os.makedirs(root, exist_ok=True)
     real_dirs = {""}
     for rel in files:
@@ -902,8 +908,11 @@ def build_farm(cid: str, files: dict) -> str:
             target = os.path.join(dst, name)
             if not os.path.lexists(target):
                 os.symlink(os.path.join(src, name), target)
+    real_root = os.path.realpath(root) + os.sep
     for rel, text in files.items():
         dst = os.path.join(root, rel)
+        if not os.path.realpath(os.path.dirname(dst)).startswith(real_root.rstrip(os.sep)):
+            raise RuntimeError(f"farm path {rel} leaves the farm")
         if os.path.lexists(dst):
             os.remove(dst)
         if text is None:
