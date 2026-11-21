@@ -925,10 +925,9 @@ def dict_key_tests(key: str, attr: str, live: dict) -> set | None:
     c = live.get(key)
     if tag not in KLTAGS or old is None or c is None:
         return None
-    v = c.__dict__.get(attr)
-    if type(v) is not dict:
+    new = fingerprint.key_fps(c.__dict__.get(attr))
+    if new is None:
         return None
-    new = fingerprint.dict_key_fps(v)
     changed = [k for k in old.keys() | new.keys() if old.get(k) != new.get(k)]
     if not changed:
         return None  # a difference the entries do not show (order ...)

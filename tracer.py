@@ -31,7 +31,9 @@ ONLY = set(os.environ.get("TRACE_ONLY", "").split(",")) - {""}
 CALIB = os.environ.get("TRACE_CALIB") == "1"  # measure plain CPU only
 # record which sqlglot module attributes each test reads (module.name), nothing else
 MODATTR = os.environ.get("TRACE_MODATTR") == "1"
-LIGHT = CALIB or MODATTR
+# record which elements tests probe (`x in cls.ATTR`) of set-valued class attributes, nothing else
+SETKEYS = os.environ.get("TRACE_SETKEYS") == "1"
+LIGHT = CALIB or MODATTR or SETKEYS
 
 sys.path.insert(0, ROOT)
 sys.path.insert(1, os.path.dirname(os.path.abspath(__file__)))
@@ -335,6 +337,134 @@ def _build_rd() -> None:
 
 
 _build_rd()
+
+
+# ----------------------------------------- set-valued attributes, by element
+# (TRACE_SETKEYS) A set-valued class attribute is recorded by element only
+# when every run-time use of its name in sqlglot and the tests is the right
+# operand of `in` / `not in`: CPython reads a set (subclass or not) straight
+# from its table in |, &, update(), set(...) and friends, so no wrapper could
+# see those. Sets referenced from anywhere but their classes stay unwrapped.
+def _membership_only_names() -> set:
+    import ast
+
+    good: set = set()
+    bad: set = set()
+    for sub in ("sqlglot", "tests"):
+        for d, _dirs, fs in os.walk(os.path.join(ROOT, sub)):
+            for f in fs:
+                if not f.endswith(".py"):
+                    continue
+                try:
+                    tree = ast.parse(_orig_open(os.path.join(d, f), encoding="utf-8").read())
+                except Exception:  # noqa: BLE001
+                    return set()
+
+                def walk(n, runtime):
+                    if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+                        runtime = True
+                    if runtime:
+                        if isinstance(n, ast.Compare):
+                            for op, c in zip(n.ops, n.comparators):
+                                if isinstance(c, ast.Attribute) and isinstance(op, (ast.In, ast.NotIn)) and len(n.ops) == 1:
+                                    c._br_member = True
+                        if isinstance(n, ast.Attribute):
+                            (good if getattr(n, "_br_member", False) and isinstance(n.ctx, ast.Load) else bad).add(n.attr)
+                        elif isinstance(n, ast.Constant) and isinstance(n.value, str) and n.value.isidentifier():
+                            bad.add(n.value)  # getattr(cls, "NAME") and the like
+                    for ch in ast.iter_child_nodes(n):
+                        walk(ch, runtime)
+
+                walk(tree, False)
+    return good - bad
+
+
+_set_tags = 0
+
+
+def _build_rs() -> None:
+    global _set_tags
+    names = _membership_only_names()
+    owners: dict = {}
+    for key, c in _all_classes:
+        if isinstance(c, enum.EnumMeta):
+            continue
+        for name in list(c.__dict__):
+            v = c.__dict__[name]
+            if name in names and type(v) in (set, frozenset):
+                owners.setdefault(id(v), []).append((c, key, name))
+    gc.collect()
+    for vid, os_ in owners.items():
+        c0, _k0, n0 = os_[0]
+        v = c0.__dict__[n0]
+        if _foreign_refs(v, [(c.__dict__, n) for c, _k, n in os_]):
+            continue
+        _keep.append(v)
+        rs = (_RSet if type(v) is set else _RFrozen)(v)
+        rs._t = len(KL_TAGS)
+        KL_TAGS.append(sorted({f"{k}|{n}" for _c, k, n in os_}))
+        for c, _k, n in os_:
+            setattr(c, n, rs)
+        _set_tags += 1
+
+
+def _whole(self) -> None:
+    if _active:
+        _kla.add(self._t)
+
+
+class _RSet(set):
+    __slots__ = ("_t",)
+
+    def __contains__(self, k):
+        if _active:
+            _klk(self._t, k)
+        return set.__contains__(self, k)
+
+    def __reduce_ex__(self, proto):
+        _whole(self)
+        return (set, (list(set.__iter__(self)),))
+
+
+class _RFrozen(frozenset):
+    __slots__ = ("_t",)
+
+    def __contains__(self, k):
+        if _active:
+            _klk(self._t, k)
+        return frozenset.__contains__(self, k)
+
+    def __reduce_ex__(self, proto):
+        _whole(self)
+        return (frozenset, (list(frozenset.__iter__(self)),))
+
+
+def _set_bulk(base_cls, name):
+    base = getattr(base_cls, name)
+
+    def f(self, *a, **k):
+        _whole(self)
+        return base(self, *a, **k)
+
+    f.__name__ = name
+    return f
+
+
+# a safety net only: the names chosen above are never used these ways
+for _cls_, _base_ in ((_RSet, set), (_RFrozen, frozenset)):
+    for _n in dir(_base_):
+        if _n in ("__contains__", "__reduce_ex__", "__reduce__", "__new__", "__init__", "__class__", "__getattribute__",
+                  "__init_subclass__", "__subclasshook__", "__class_getitem__", "__setattr__", "__delattr__", "__hash__"):
+            continue
+        if callable(getattr(_base_, _n)):
+            setattr(_cls_, _n, _set_bulk(_base_, _n))
+    _cls_.__reduce__ = lambda self: self.__reduce_ex__(2)  # noqa: E731
+_RFrozen.__hash__ = frozenset.__hash__
+
+if SETKEYS:
+    _build_rs()
+    print(f"sets by element: {_set_tags}", file=sys.stderr)
+
 for key, c in _all_classes:
     class_keys[id(c)] = key
     if LIGHT or isinstance(c, enum.EnumMeta):
@@ -465,6 +595,22 @@ def run_child(num: int) -> None:
 
     _sp.Popen.__init__ = _popen_init
     _mpp.BaseProcess.start = _start
+    if SETKEYS:
+        _kl.clear()
+        _kla.clear()
+        res = unittest.TestResult()
+        _active = True
+        try:
+            loaded[num].run(res)
+        finally:
+            _active = False
+        rec = {"n": num, "failed": bool(res.failures or res.errors or res.unexpectedSuccesses), "kl": _kl_out(),
+               "kla": sorted({tag for t in _kla for tag in KL_TAGS[t]}), "spawned": spawned}
+        tmp = os.path.join(OUT, f".{num}.json")
+        with _orig_open(tmp, "w") as f:
+            json.dump(rec, f)
+        os.replace(tmp, os.path.join(OUT, f"{num}.json"))
+        return
     if MODATTR:
         _ma.clear()
         res = unittest.TestResult()

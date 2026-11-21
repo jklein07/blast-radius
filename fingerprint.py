@@ -329,13 +329,32 @@ def dict_key_fps(d: dict) -> dict:
     return out
 
 
+def set_key_fps(s) -> dict:
+    """element id -> "1" (like dict_key_fps with every value the same);
+    LEN_KEY holds the size."""
+    out: dict = {LEN_KEY: str(len(s))}
+    for e in s:
+        out[key_id(e)] = "1"
+    return out
+
+
+def key_fps(v):
+    """dict_key_fps / set_key_fps by type, None for anything else."""
+    if type(v) is dict:
+        return dict_key_fps(v)
+    if type(v) in (set, frozenset):
+        return {"#type": type(v).__name__, **set_key_fps(v)}
+    return None
+
+
 def dict_snapshot(root_pkg: str = "sqlglot") -> dict:
-    """'class key|attr' -> dict_key_fps for every dict-valued class attribute."""
+    """'class key|attr' -> key_fps for every dict-, set- or frozenset-valued
+    class attribute."""
     out: dict = {}
     for key, c in list(iter_classes(sorted(sys.modules), root_pkg)):
         if isinstance(c, enum.EnumMeta):
             continue
         for name, v in list(c.__dict__.items()):
-            if type(v) is dict and not (name.startswith("__") and name.endswith("__")):
-                out[f"{key}|{name}"] = dict_key_fps(v)
+            if type(v) in (dict, set, frozenset) and not (name.startswith("__") and name.endswith("__")):
+                out[f"{key}|{name}"] = key_fps(v)
     return out

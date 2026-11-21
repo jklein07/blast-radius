@@ -68,6 +68,28 @@ for t in tests:
     for tag in r.get("kla", ()):
         kla.setdefault(tag, set()).add(li)
 
+# set-valued class attributes recorded by element (tracer.py TRACE_SETKEYS):
+# the same shape as dicts recorded by key
+sk_dir = os.environ.get("SETKL_DIR")
+sk_tags: list = []
+if sk_dir:
+    sk_missing = [t["number"] for t in tests if not os.path.exists(os.path.join(sk_dir, f"{t['number']}.json"))]
+    if sk_missing:
+        raise SystemExit(f"set element trace incomplete: {len(sk_missing)} tests missing")
+    sk_tags = json.load(open(os.path.join(sk_dir, "_kl_tags.json")))
+    for t in tests:
+        r = json.load(open(os.path.join(sk_dir, f"{t['number']}.json")))
+        li = num2local[r["n"]]
+        if r["failed"]:
+            failed.append(li)
+        for tag, kids in r.get("kl", {}).items():
+            d = kl.setdefault(tag, {})
+            for kid in kids:
+                d.setdefault(kid, set()).add(li)
+        for tag in r.get("kla", ()):
+            kla.setdefault(tag, set()).add(li)
+    print("sets by element:", len(sk_tags), file=sys.stderr)
+
 print("missing traces", missing, "failed under trace", [ids[i] for i in failed], "spawners", [ids[i] for i in spawners], file=sys.stderr)
 
 dirreads = {p: s for p, s in reads.items() if os.path.isdir(os.path.join(root, p))}
@@ -466,7 +488,7 @@ maps = {
     "vcpu": vcpu,
     "vcpu_alt": vcpu_alt,
     # dict-valued class attributes recorded by key (tracer.py _RD)
-    "kltags": json.load(open(os.path.join(trace_dir, "_kl_tags.json"))) if os.path.exists(os.path.join(trace_dir, "_kl_tags.json")) else [],
+    "kltags": sorted(set(json.load(open(os.path.join(trace_dir, "_kl_tags.json"))) if os.path.exists(os.path.join(trace_dir, "_kl_tags.json")) else []) | set(sk_tags)),
     "kl": {tag: {kid: sid(s) for kid, s in d.items()} for tag, d in kl.items()},
     "kla": {tag: sid(s) for tag, s in kla.items()},
     "modattr": {k: sid(s) for k, s in modattr.items()},
