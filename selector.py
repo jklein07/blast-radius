@@ -1406,9 +1406,9 @@ def expr_registry_grew(pristine: dict, diff: dict, plan: Plan) -> bool:
 
 
 def fresh_member(key: str, attr: str, plan: Plan, pristine: dict) -> bool:
-    """A class member the patch adds under a name that appears nowhere else:
-    not in any pristine file and only once (its own definition) in the
-    patched files. Nothing can read it by name, and on a class whose whole
+    """A class member the patch adds under a name that appears in no
+    pristine file. Only the patch's own new text can name it (its definition,
+    and calls from changed code, which are charged as such), and on a class whose whole
     MRO is sqlglot code (no Enum, dataclass, NamedTuple or Protocol, no
     foreign metaclass) nothing enumerates members generically, except the
     generator's dispatch on public *_sql methods (dispatch_member_tests)."""
@@ -1484,15 +1484,12 @@ def dispatch_member_tests(key: str, attr: str, plan: Plan, pristine: dict, sub: 
 
 def _fresh_class(key: str, attr: str, plan: Plan, pristine: dict):
     """The live class, when attr is a member the patch adds to it under a
-    name found in no pristine file and only once in the patched files, on a
-    class whose MRO is all sqlglot code; else None."""
-    import re
-
+    name found in no pristine file, on a class whose MRO is all sqlglot code;
+    else None. Every other mention of the name is then new text in a changed
+    file (a call from a changed function, say), and the change there is
+    charged on its own."""
     cls = _member_class(key, attr, pristine)
     if cls is None:
-        return None
-    pat = re.compile(r"(?<![A-Za-z0-9_])" + re.escape(attr) + r"(?![A-Za-z0-9_])")
-    if sum(len(pat.findall(t)) for t in plan.files.values() if t) != 1:
         return None
     return None if _mentions(attr, []) else cls
 

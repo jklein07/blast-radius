@@ -38,11 +38,13 @@ them across workers.
      on by name), every use is its def or an attribute load on `self`, `cls`
      or `super()`, the classes that define it have only sqlglot bases, and
      neither name appears in any other file.
-   - *New class members nothing names.* A member the patch adds to a class
-     (a constant or a method) under a name that appears in no pristine file
-     and only once in the patched files is read by nothing, when the class's
-     whole MRO is sqlglot code (no Enum, dataclass, NamedTuple or Protocol)
-     and the name is not dunder, `_sunder_` or `*_sql`. A new public `X_sql`
+   - *New class members nothing else names.* A member the patch adds to a
+     class (a constant or a method) under a name that appears in no pristine
+     file can be reached only through the patch's own new text (say, a call
+     from a changed method), and those changes are charged on their own. The
+     member itself charges nothing when the class's whole MRO is sqlglot code
+     (no Enum, dataclass, NamedTuple or Protocol) and the name is not dunder,
+     `_sunder_` or `*_sql`. A new public `X_sql`
      method on a generator is reached only through the generator's dispatch
      (keyed by the expression class `X`) or a `node.key + "_sql"` lookup.
      That holds when no ancestor defines the name, every subclass resolves it
