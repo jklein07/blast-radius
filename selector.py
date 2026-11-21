@@ -197,6 +197,11 @@ MODREADS: dict = M["module_reads"]  # test file -> [paths read while importing]
 MODLINES: dict = M.get("module_lines", {})  # test file -> {sqlglot file: [lines run while importing]}
 IMPORT_LINES = M["import_lines"]
 NAMES = _Names(M["names"], M.get("name_files", []))  # module -> name -> [(file, line), ...]
+# tests that read a sqlglot module attribute (module.name, from-imports), by
+# "module|name" (re-exports included) and by module (tracer.py TRACE_MODATTR);
+# for the modules recorded there NAMES holds bare-name references only
+MODATTR: dict = M.get("modattr", {})
+MODATTR_MOD: dict = M.get("modattr_mod", {})
 TEST_IMPORTERS: dict = M["test_importers"]  # test module file -> [test files importing it, transitively]
 NOVERIFY = {_local2num[i] for i in M["noverify"] if _local2num[i] is not None}
 VCPU = {}
@@ -964,6 +969,10 @@ def snapshot_candidates(pristine: dict, patched: dict, diff: dict, plan: Plan) -
                         out |= global_ref_tests(m, ta)
                         for f, ln in NAMES.refs(pkg, n):
                             out |= cov_tests(f, [ln])
+                        for k in (f"{pkg}|{n}", f"{pkg}|__dict__"):
+                            sid = MODATTR.get(k)
+                            if sid is not None:
+                                out.update(SETS[sid])
             # tests that list its folder may import every module in it
             sid = DIRREADS.get(os.path.dirname(_mod_rel(m)))
             if sid is not None:
@@ -1136,9 +1145,16 @@ def global_ref_tests(mod: str, name: str) -> set:
         rel = mod.replace(".", "/") + ".py"
         for ln, sid_ in COV.get(rel, {}).items():
             out.update(SETS[sid_])
+        sid_ = MODATTR_MOD.get(mod)
+        if sid_ is not None:
+            out.update(SETS[sid_])
         return out
     for f, ln in NAMES.refs(mod, name):
         out |= cov_tests(f, [ln])
+    for k in (f"{mod}|{name}", f"{mod}|__dict__"):
+        sid_ = MODATTR.get(k)
+        if sid_ is not None:
+            out.update(SETS[sid_])
     rel = mod.replace(".", "/") + ".py"
     spans = M["defs"].get(rel, {}).get(name)
     if spans:

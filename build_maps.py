@@ -128,6 +128,19 @@ for f, tree in trees.items():
                     names.add((al.asname or al.name).split(".")[0])
     mod_names[modname(f)] = names
 
+# module attribute reads measured by tracer.py (TRACE_MODATTR): for the
+# modules it recorded, an attribute access `x.G` somewhere no longer counts as
+# a reference to M's global G; the tests that really read module.G do.
+ma_dir = os.environ.get("MODATTR_DIR")
+ma_import = None
+ma_mods: set = set()
+if ma_dir:
+    ma_missing = [t["number"] for t in tests if not os.path.exists(os.path.join(ma_dir, f"{t['number']}.json"))]
+    if ma_missing:
+        raise SystemExit(f"module attribute trace incomplete: {len(ma_missing)} tests missing")
+    ma_import = json.load(open(os.path.join(ma_dir, "_ma_import.json")))
+    ma_mods = set(ma_import["modules"])
+
 # references: for module M name G -> lines that load G from M
 attr_lines: dict[str, list] = {}
 name_lines: dict[str, dict[str, list]] = {}  # file -> name -> lines
@@ -173,8 +186,9 @@ for m, names in mod_names.items():
             for ln in name_lines.get(f, {}).get(g, []):
                 refs.add((f, ln))
             # re-exported through a package: users access pkg.G
-        for f, ln in attr_lines.get(g, []):
-            refs.add((f, ln))
+        if m not in ma_mods:
+            for f, ln in attr_lines.get(g, []):
+                refs.add((f, ln))
         out_m[g] = sorted(refs)
 
 # every import statement of a sqlglot module or name: "mod" / "mod|name" ->
@@ -336,6 +350,71 @@ for f in test_imports:
     for x in seen:
         importers.setdefault(x, set()).add(f)
 
+# module attribute readers, by "module|name": the tests that read module.name
+# (or from-imported it at run time), and the readers of the same name in every
+# module that re-exports it by a from-import or a star import (it is the same
+# object there); "module|__dict__" readers (vars(), ...) count for every name
+modattr: dict[str, set] = {}
+modattr_mod: dict[str, set] = {}
+if ma_import is not None:
+    files_local: dict[str, list] = {}
+    for t in tests:
+        files_local.setdefault(t["file"], []).append(num2local[t["number"]])
+    raw_ma: dict[str, set] = {}
+
+    def _ma_add(k, users):
+        raw_ma.setdefault(k, set()).update(users)
+        modattr_mod.setdefault(k.partition("|")[0], set()).update(users)
+
+    for t in tests:
+        r = json.load(open(os.path.join(ma_dir, f"{t['number']}.json")))
+        li = num2local[r["n"]]
+        for k in r["ma"]:
+            _ma_add(k, (li,))
+    for f, keys in ma_import["by_import"].items():
+        users = files_local.get(f, ())
+        for k in keys:
+            _ma_add(k, users)
+    for f, keys in ma_import["by_frame"].items():
+        users = set(files_local.get(f, ()))
+        for g in importers.get(f, ()):
+            users.update(files_local.get(g, ()))
+        for k in keys:
+            _ma_add(k, users)
+    # re-exports: "M|G" -> modules P binding the same G (from M import G / from M import *)
+    reexp: dict[str, set] = {}
+    for key, sites in from_imports.items():
+        m_, _, g_ = key.partition("|")
+        for f, alias in sites:
+            if f.startswith("sqlglot/") and alias == g_:
+                reexp.setdefault(key, set()).add(modname(f))
+    star_by: dict[str, set] = {}
+    for m_, fs in star_imports.items():
+        for f in fs:
+            if f.startswith("sqlglot/"):
+                star_by.setdefault(m_, set()).add(modname(f))
+    names_seen = {k.partition("|")[2] for k in raw_ma}
+    for m_ in mod_names:
+        for g_ in mod_names[m_] & names_seen:
+            todo, seen_m = [m_], set()
+            while todo:
+                x = todo.pop()
+                if x in seen_m:
+                    continue
+                seen_m.add(x)
+                todo.extend(reexp.get(f"{x}|{g_}", ()))
+                todo.extend(star_by.get(x, ()))
+            users = set()
+            for x in seen_m:
+                users |= raw_ma.get(f"{x}|{g_}", set())
+                users |= raw_ma.get(f"{x}|__dict__", set())
+            if users:
+                modattr[f"{m_}|{g_}"] = users
+    for k, v in raw_ma.items():  # __dict__, and names a module gets lazily (PEP 562) or at run time
+        modattr.setdefault(k, v)
+    print("module attribute readers:", len(modattr), "keys,", len(modattr_mod), "modules,",
+          sum(len(v) for k, v in modattr.items() if k.endswith("|__dict__")), "module __dict__ reads", file=sys.stderr)
+
 # tests we should not trust a verification run for
 noverify = set(failed)
 for i, tid in enumerate(ids):
@@ -390,6 +469,9 @@ maps = {
     "kltags": json.load(open(os.path.join(trace_dir, "_kl_tags.json"))) if os.path.exists(os.path.join(trace_dir, "_kl_tags.json")) else [],
     "kl": {tag: {kid: sid(s) for kid, s in d.items()} for tag, d in kl.items()},
     "kla": {tag: sid(s) for tag, s in kla.items()},
+    "modattr": {k: sid(s) for k, s in modattr.items()},
+    "modattr_mod": {k: sid(s) for k, s in modattr_mod.items()},
+    "modattr_mods": sorted(ma_mods),
 }
 os.makedirs(os.path.dirname(out) or ".", exist_ok=True)
 raw = json.dumps(maps, separators=(",", ":"))

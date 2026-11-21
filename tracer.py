@@ -29,6 +29,9 @@ OUT = sys.argv[3]
 JOBS = int(sys.argv[4]) if len(sys.argv) > 4 else os.cpu_count() or 2
 ONLY = set(os.environ.get("TRACE_ONLY", "").split(",")) - {""}
 CALIB = os.environ.get("TRACE_CALIB") == "1"  # measure plain CPU only
+# record which sqlglot module attributes each test reads (module.name), nothing else
+MODATTR = os.environ.get("TRACE_MODATTR") == "1"
+LIGHT = CALIB or MODATTR
 
 sys.path.insert(0, ROOT)
 sys.path.insert(1, os.path.dirname(os.path.abspath(__file__)))
@@ -98,6 +101,51 @@ mods, errors = fingerprint.import_all("sqlglot")
 if errors:
     print("import errors", errors, file=sys.stderr)
 
+# ------------------------------------------------- module attribute reads
+# (TRACE_MODATTR) Every sqlglot module gets a ModuleType subclass whose
+# __getattribute__ records `module.name` reads (from-imports included): per
+# test while it runs, and while the test modules import, both by the test
+# file being imported and by the tests/ file whose code made the read (a
+# helper module imports once, for the first test file that needs it).
+import types  # noqa: E402
+
+_ma: set = set()
+_ma_imp: dict = {}  # test file being imported -> keys
+_ma_frame: dict = {}  # tests/ file whose code read it at import time -> keys
+_ma_mode = 0  # 0 off, 1 importing test modules, 2 running a test
+_ma_cur = ""
+_ma_name: dict = {}  # id(module) -> name
+
+
+class _RecModule(types.ModuleType):
+    def __getattribute__(self, name):
+        if _ma_mode:
+            m = _ma_name.get(id(self))
+            if m is not None:
+                k = m + "|" + name
+                if _ma_mode == 2:
+                    _ma.add(k)
+                else:
+                    _ma_imp.setdefault(_ma_cur, set()).add(k)
+                    f = sys._getframe(1).f_code.co_filename
+                    if f.startswith(PREFIX + "tests/"):
+                        _ma_frame.setdefault(f[len(PREFIX):], set()).add(k)
+        return types.ModuleType.__getattribute__(self, name)
+
+
+def _swap_modules() -> None:
+    for name, m in list(sys.modules.items()):
+        if (name == "sqlglot" or name.startswith("sqlglot.")) and type(m) is types.ModuleType and id(m) not in _ma_name:
+            try:
+                m.__class__ = _RecModule
+                _ma_name[id(m)] = name
+            except TypeError:
+                print("cannot record module", name, file=sys.stderr)
+
+
+if MODATTR:
+    _swap_modules()
+
 tests = json.load(_orig_open(TESTS_JSON))["tests"]
 by_module: dict[str, list[dict]] = {}
 for t in tests:
@@ -109,6 +157,8 @@ loaded: dict[int, unittest.TestSuite] = {}
 for f in sorted(by_module):
     modname = f[:-3].replace("/", ".")
     _reads.clear()
+    _ma_cur = f
+    _ma_mode = 1 if MODATTR else 0
     try:
         __import__(modname)
     except Exception as e:  # noqa: BLE001
@@ -122,6 +172,9 @@ for f in sorted(by_module):
         except Exception as e:  # noqa: BLE001
             print("cannot load", name, e, file=sys.stderr)
 
+_ma_mode = 0
+if MODATTR:
+    _swap_modules()  # modules only the test files imported
 sys.monitoring.set_events(4, 0)
 sys.monitoring.free_tool_id(4)
 
@@ -264,7 +317,7 @@ _keep: list = []
 def _build_rd() -> None:
     # (a function, so no module-level variable holds a dict while referrers are checked)
     for key, c in _all_classes:
-        if CALIB or isinstance(c, enum.EnumMeta):
+        if LIGHT or isinstance(c, enum.EnumMeta):
             continue
         for name in list(c.__dict__):
             if not (name.startswith("__") and name.endswith("__")) and type(c.__dict__[name]) is dict:
@@ -284,7 +337,7 @@ def _build_rd() -> None:
 _build_rd()
 for key, c in _all_classes:
     class_keys[id(c)] = key
-    if CALIB or isinstance(c, enum.EnumMeta):
+    if LIGHT or isinstance(c, enum.EnumMeta):
         continue
     for name, v in list(c.__dict__.items()):
         if name.startswith("__") and name.endswith("__"):
@@ -306,7 +359,7 @@ def _dispatch_by_key() -> None:
     entry of the table differs between two versions only when TRANSFORMS
     differs at that key, so lookups in the table are recorded as lookups of
     the same key in TRANSFORMS instead."""
-    if CALIB:
+    if LIGHT:
         return
     import sqlglot.generator as g
 
@@ -370,7 +423,7 @@ TOOL = 3
 
 
 def run_child(num: int) -> None:
-    global _active
+    global _active, _ma_mode
     lines: dict[str, set[int]] = {}
 
     def on_line(code, line):
@@ -412,6 +465,20 @@ def run_child(num: int) -> None:
 
     _sp.Popen.__init__ = _popen_init
     _mpp.BaseProcess.start = _start
+    if MODATTR:
+        _ma.clear()
+        res = unittest.TestResult()
+        _ma_mode = 2
+        try:
+            loaded[num].run(res)
+        finally:
+            _ma_mode = 0
+        rec = {"n": num, "failed": bool(res.failures or res.errors or res.unexpectedSuccesses), "ma": sorted(_ma), "spawned": spawned}
+        tmp = os.path.join(OUT, f".{num}.json")
+        with _orig_open(tmp, "w") as f:
+            json.dump(rec, f)
+        os.replace(tmp, os.path.join(OUT, f"{num}.json"))
+        return
     if CALIB:
         res = unittest.TestResult()
         c0 = time.process_time()
@@ -468,6 +535,11 @@ def main() -> None:
         json.dump({k: sorted(v) for k, v in _imp_lines.items()}, f)
     with _orig_open(os.path.join(OUT, "_kl_tags.json"), "w") as f:
         json.dump(sorted({tag for tags in KL_TAGS for tag in tags}), f)  # dicts recorded by key
+    if MODATTR:
+        with _orig_open(os.path.join(OUT, "_ma_import.json"), "w") as f:
+            json.dump({"by_import": {k: sorted(v) for k, v in _ma_imp.items()},
+                       "by_frame": {k: sorted(v) for k, v in _ma_frame.items()},
+                       "modules": sorted(_ma_name.values())}, f)
     todo = [n for n in sorted(loaded) if not os.path.exists(os.path.join(OUT, f"{n}.json"))]
     if ONLY:
         todo = [n for n in todo if str(n) in ONLY]
