@@ -318,6 +318,41 @@ class _Annotations(ast.NodeTransformer):
         return n
 
 
+def _strip_annotations(tree, defs: bool) -> None:
+    """What _Annotations(defs).visit(tree) does, walking statement lists only:
+    defs, classes and annotated assignments are statements, and no
+    expression holds a statement."""
+
+    def walk(stmts, depth):
+        for n in stmts:
+            t = type(n)
+            if t is ast.FunctionDef or t is ast.AsyncFunctionDef:
+                if defs:
+                    n.returns = None
+                    a = n.args
+                    for x in a.posonlyargs + a.args + a.kwonlyargs + [y for y in (a.vararg, a.kwarg) if y is not None]:
+                        x.annotation = None
+                walk(n.body, depth + 1)
+                continue
+            if t is ast.ClassDef:
+                walk(n.body, 0)  # a class body is its own (class) scope
+                continue
+            if t is ast.AnnAssign:
+                if depth > 0:
+                    n.annotation = ast.Constant(value=None)
+                continue
+            for f in ("body", "orelse", "finalbody"):
+                sub = getattr(n, f, None)
+                if sub:
+                    walk(sub, depth)
+            for h in getattr(n, "handlers", None) or ():
+                walk(h.body, depth)
+            for c in getattr(n, "cases", None) or ():
+                walk(c.body, depth)
+
+    walk(tree.body, 0)
+
+
 def _noop(x) -> bool:
     return isinstance(x, ast.Expr) and isinstance(x.value, ast.Constant)
 
@@ -373,8 +408,8 @@ def analyze(old_src: str | None, new_src: str | None, old_changed=None, new_chan
         # also compare the encoding-sensitive bits: the module docstring etc. are in the AST already
         return c
     defs = _future_annotations(a) and _future_annotations(b)
-    _Annotations(defs).visit(a)
-    _Annotations(defs).visit(b)
+    _strip_annotations(a, defs)
+    _strip_annotations(b, defs)
     _Walker(c, (old_src or "").split("\n"), (new_src or "").split("\n")).seq(a.body, b.body, (a,), None, a)
     c.semantic = bool(c.runtime_lines or c.import_time or c.def_changes or c.import_lines)
     return c
