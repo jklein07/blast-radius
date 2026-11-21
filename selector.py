@@ -2320,10 +2320,67 @@ def fe_check_queries(vfe: dict) -> tuple[set, dict]:
     return failing, runs
 
 
+CHILD_MEM = int(float(os.environ.get("BR_CHILD_MEM_MB", "1300")) * (1 << 20))
+CHILD_VM = int(float(os.environ.get("BR_CHILD_VM_MB", "3000")) * (1 << 20))
+_VM0 = [0]
+
+
+def _status_kb(field: str):
+    with open("/proc/self/status") as fh:
+        return next((int(l.split()[1]) for l in fh if l.startswith(field + ":")), None)
+
+
+def cap_memory() -> None:
+    """A patch can make a test allocate without end (a loop that keeps
+    growing a list), faster than its timer fires; two children run at once
+    in a 4 GB container. A thread checks this child's resident memory every
+    10 ms and kills the child (and anything it started) once it holds
+    CHILD_MEM bytes more than at the fork: with no answer from it, the
+    parent keeps every candidate. Address space is capped too, far above
+    that, for a single allocation too big to wait for (libraries such as
+    duckdb reserve address space they never touch, so resident memory is
+    the real measure)."""
+    try:
+        import resource
+        import threading
+
+        page = os.sysconf("SC_PAGE_SIZE")
+        fd = os.open("/proc/self/statm", os.O_RDONLY)
+
+        def rss() -> int:
+            return int(os.pread(fd, 128, 0).split()[1]) * page
+
+        limit = rss() + CHILD_MEM
+        base = _status_kb("VmData")
+        if base is not None:
+            _VM0[0] = base
+            cap = base * 1024 + CHILD_VM
+            soft, hard = resource.getrlimit(resource.RLIMIT_DATA)
+            if hard != resource.RLIM_INFINITY:
+                cap = min(cap, hard)
+            resource.setrlimit(resource.RLIMIT_DATA, (cap, hard))
+
+        def watch() -> None:
+            while True:
+                time.sleep(0.01)
+                try:
+                    if rss() > limit:
+                        if os.getpgid(0) == os.getpid():  # its own group (never the parent's)
+                            os.killpg(os.getpid(), signal.SIGKILL)
+                        os.kill(os.getpid(), signal.SIGKILL)
+                except Exception:  # noqa: BLE001
+                    return
+
+        threading.Thread(target=watch, daemon=True).start()
+    except Exception:  # noqa: BLE001  (no /proc: nothing to do)
+        pass
+
+
 def child_main(plan: Plan, wfd: int) -> None:
     """Runs in a forked child. Writes one JSON object to wfd."""
     result: dict = {"cid": plan.cid}
     os.dup2(2, 1)  # tests may print: never let a child write to our stdout
+    cap_memory()
     try:
         _ph("start")
         root = build_farm(plan.cid, plan.files)
@@ -2418,6 +2475,11 @@ def child_main(plan: Plan, wfd: int) -> None:
     if DEBUG:
         _ph("end")
         result["prof"] = PROF
+        result["maxrss_mb"] = round(_u.ru_maxrss / 1024)
+        try:
+            result["vmdata_mb"] = round((_status_kb("VmData") - _VM0[0]) / 1024)
+        except Exception:  # noqa: BLE001
+            pass
     data = (json.dumps(result) + "\n").encode()
     while data:
         k = os.write(wfd, data)
