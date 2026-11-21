@@ -30,29 +30,70 @@ _VALUE_TYPES = (datetime.date, datetime.time, datetime.timedelta, datetime.tzinf
 _FUNC_TYPES = (types.FunctionType, types.BuiltinFunctionType, types.MethodType, types.BuiltinMethodType)
 
 
+_LOG_TYPES = (logging.Logger, logging.LoggerAdapter, logging.Handler, logging.Filter)
+_THREAD_MODS = ("threading", "_thread", "weakref", "_weakref", "_weakrefset")
+_KIND: dict = {}  # type -> which leaf rule applies to its instances (0: none)
+_LEAF: dict = {}  # id -> (object, string) for enum members and classes (the object is held, so its id stays unique)
+
+
+def _kind(t) -> int:
+    if t in _SIMPLE:
+        k = 1
+    elif issubclass(t, enum.Enum):
+        k = 2
+    elif issubclass(t, type):
+        k = 3
+    elif issubclass(t, types.ModuleType):
+        k = 4
+    elif issubclass(t, _LOG_TYPES):
+        k = 5
+    elif t.__module__ in _THREAD_MODS:
+        k = 6
+    elif issubclass(t, re.Pattern):
+        k = 7
+    elif issubclass(t, _VALUE_TYPES):
+        k = 8
+    elif hasattr(t, "arg_types") and t.__module__.startswith("sqlglot"):
+        k = 9
+    else:
+        k = 0
+    _KIND[t] = k
+    return k
+
+
 def _fp(v, depth: int, seen: set) -> str:
     t = type(v)
-    if t in _SIMPLE:
-        return f"{t.__name__}:{v!r}"
-    if isinstance(v, enum.Enum):
-        return f"E:{type(v).__module__}.{type(v).__qualname__}.{v.name}"
-    if isinstance(v, type):
-        return f"C:{getattr(v, '__module__', '?')}.{getattr(v, '__qualname__', '?')}"
-    if isinstance(v, types.ModuleType):
-        return f"M:{v.__name__}"
-    if isinstance(v, (logging.Logger, logging.LoggerAdapter, logging.Handler, logging.Filter)):
-        return f"LOG:{type(v).__name__}:{getattr(v, 'name', '')}"
-    if t.__module__ in ("threading", "_thread", "weakref", "_weakref", "_weakrefset"):
-        return f"T:{t.__qualname__}"
-    if isinstance(v, re.Pattern):
-        return f"RE:{v.pattern!r}:{v.flags}"
-    if isinstance(v, _VALUE_TYPES):
-        return f"V:{t.__qualname__}:{v!r}"
-    if hasattr(t, "arg_types") and hasattr(v, "args") and t.__module__.startswith("sqlglot"):
-        try:  # sqlglot expression trees: depth-independent
-            return f"X:{t.__qualname__}:{v!r}"
-        except Exception:  # noqa: BLE001
-            pass
+    k = _KIND.get(t)
+    if k is None:
+        k = _kind(t)
+    if k:  # depth-independent leaves (the rule is decided once per type)
+        if k == 1:
+            return f"{t.__name__}:{v!r}"
+        if k == 2 or k == 3:  # enum members and classes: same string while the snapshot runs
+            hit = _LEAF.get(id(v))
+            if hit is not None and hit[0] is v:
+                return hit[1]
+            if k == 2:
+                r = f"E:{t.__module__}.{t.__qualname__}.{v.name}"
+            else:
+                r = f"C:{getattr(v, '__module__', '?')}.{getattr(v, '__qualname__', '?')}"
+            _LEAF[id(v)] = (v, r)
+            return r
+        if k == 4:
+            return f"M:{v.__name__}"
+        if k == 5:
+            return f"LOG:{t.__name__}:{getattr(v, 'name', '')}"
+        if k == 6:
+            return f"T:{t.__qualname__}"
+        if k == 7:
+            return f"RE:{v.pattern!r}:{v.flags}"
+        if k == 8:
+            return f"V:{t.__qualname__}:{v!r}"
+        if hasattr(v, "args"):
+            try:  # sqlglot expression trees: depth-independent
+                return f"X:{t.__qualname__}:{v!r}"
+            except Exception:  # noqa: BLE001
+                pass
     if depth <= 0:
         return f"T:{t.__qualname__}"
     vid = id(v)
@@ -134,6 +175,8 @@ _ROOTS: list[str] = []
 def fp(v, depth: int = 8) -> str:
     try:
         s = _fp(v, depth, set())
+        if len(_LEAF) > 200000:
+            _LEAF.clear()
         for r in _ROOTS:
             s = s.replace(r, "<ROOT>")
     except Exception as e:  # pragma: no cover - defensive

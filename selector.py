@@ -211,6 +211,7 @@ for _i, _c in M.get("vcpu_alt" if os.environ.get("BR_CALIB") == "alt" and M.get(
     if _n is not None:
         VCPU[_n] = _c * VSCALE
 SPAWNERS = {_local2num[i] for i in M.get("spawners", []) if _local2num[i] is not None}
+LAZY_NUM = next((t["number"] for t in TESTS if t["id"] == "tests/dialects/test_dialect.py::TestDialect::test_lazy_load"), None)
 # dict-valued class attributes the tracer recorded by key (tracer.py _RD)
 KLTAGS = set(M.get("kltags", ()))
 KL: dict = M.get("kl", {})  # "class|attr" -> {key id: setid of tests that looked it up}
@@ -1576,6 +1577,17 @@ def child_main(plan: Plan, wfd: int) -> None:
         sys.dont_write_bytecode = True
         cands = Cands(plan.cands)
         everything = False
+        lazy = None
+        if plan.need_snapshot and LAZY_NUM in cands and FILE_OF[LAZY_NUM] not in plan.files:
+            # test_lazy_load runs `import sqlglot; assert len(sqlglot.Dialect._classes) == 1`
+            # in a fresh interpreter from the checkout. Nothing here has imported
+            # sqlglot yet, so doing that import first answers it without the subprocess.
+            try:
+                import sqlglot as _sg
+
+                lazy = len(_sg.Dialect._classes) == 1
+            except BaseException:  # noqa: BLE001
+                lazy = False
         if plan.need_snapshot:
             import fingerprint
 
@@ -1619,12 +1631,14 @@ def child_main(plan: Plan, wfd: int) -> None:
             vsplit = {n: v for n, v in split.items() if n in verify}
             vfe = {n: v for n, v in vsplit.items() if v[4] == "fe"}
             vrun = {n: v for n, v in vsplit.items() if v[4] != "fe"}
-            rest = [n for n in verify if n not in vfe]
+            rest = [n for n in verify if n not in vfe and not (n == LAZY_NUM and lazy is not None)]
             fe_failing, fe_runs = fe_check_queries(vfe) if vfe else (set(), {})
             rest += sorted(fe_runs)
             vrun = {**vrun, **fe_runs}
             failing, _ = run_tests(rest, vrun) if rest else (set(), set())
             failing |= fe_failing
+            if lazy is False and LAZY_NUM in verify:
+                failing.add(LAZY_NUM)
             if vsplit:
                 result["split"] = {str(n): [len(v[1]), v[3], v[4], n in failing] + ([len(fe_runs[n][1])] if n in fe_runs else []) for n, v in vsplit.items()}
             result["select"] = sorted(set(include) | failing)
