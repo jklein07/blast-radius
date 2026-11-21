@@ -100,7 +100,7 @@ if os.path.exists(_BIN):
     import marshal
 
     with open(_BIN, "rb") as fh:
-        M = marshal.load(fh)
+        M = marshal.loads(fh.read())  # one read: marshal.load(fh) reads in small pieces, ~7x slower
 else:
     with gzip.open(MAPS, "rt") as fh:
         M = json.load(fh)
