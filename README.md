@@ -184,7 +184,8 @@ them across workers.
    run in the child with an in-process pool whose tasks run, in the order
    they were submitted, when their result is first asked for; so a test
    that fails at one pair never computes the pairs after it, and a test
-   that passes runs every task as before. A patch can also
+   that passes runs every task as before. Pairs marked with a dialect whose
+   own file the patch changes are checked first. A patch can also
    make a test allocate without end, faster than any timer: a thread in each
    child stops it once it holds 1.3 GB more than at the fork (address space
    is capped too, far above that), and that commit keeps every candidate, so

@@ -30,14 +30,22 @@ def _roundtrip(x):
 
 
 LAZY = False  # the selector turns it on; the build-time tracers run every task at submit
+# Dialect names of the files a patch changes (the selector sets it). A task
+# submitted with one of them among its arguments (a fixture pair marked
+# `# dialect: tsql`, for a patch to the tsql dialect) is handed out first by
+# as_completed: if the test is going to fail, it most likely fails there,
+# and then the other pairs never run. A real pool finishes tasks in no
+# particular order, and a test that passes still runs every task.
+HOT: frozenset = frozenset()
 
 
 class LazyFuture(cf.Future):
     """A future whose task runs at the first call that needs its outcome."""
 
-    def __init__(self, thunk):
+    def __init__(self, thunk, tags=frozenset()):
         super().__init__()
         self._thunk = thunk
+        self._tags = tags
 
     def _force(self):
         thunk, self._thunk = self._thunk, None
@@ -72,6 +80,10 @@ def as_completed(fs, timeout=None):
     if not all(isinstance(f, LazyFuture) for f in fs):
         yield from cf.as_completed(fs, timeout)
         return
+    if HOT:
+        first = [f for f in fs if f._tags & HOT]
+        if first:
+            fs = first + [f for f in fs if not (f._tags & HOT)]
     for f in fs:
         f._force()
         yield f
@@ -95,7 +107,8 @@ class InlineExecutor(cf.Executor):
 
     def submit(self, fn, /, *args, **kwargs):
         if LAZY:
-            return LazyFuture(lambda f: self._run(f, fn, args, kwargs))
+            tags = frozenset(a for a in (*args, *kwargs.values()) if type(a) is str and len(a) <= 32) if HOT else frozenset()
+            return LazyFuture(lambda f: self._run(f, fn, args, kwargs), tags)
         f: cf.Future = cf.Future()
         self._run(f, fn, args, kwargs)
         return f

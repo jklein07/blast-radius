@@ -63,6 +63,7 @@ PRELOAD = os.environ.get("BR_PRELOAD", "1") == "1"
 XCACHE = os.environ.get("BR_XCACHE", os.path.join(APP, "xcache.bin"))
 XFAST = os.environ.get("BR_XFAST", "1") == "1" and os.path.exists(XCACHE)
 FARM: list = [None]  # a child's patched tree
+HOT_NAMES: set = set()  # in a child: dialects whose own files the patch changes
 
 for _v in ("OPENBLAS_NUM_THREADS", "OMP_NUM_THREADS", "MKL_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
     os.environ.setdefault(_v, "1")
@@ -2460,6 +2461,8 @@ def run_tests(nums: list[int], split: dict | None = None) -> tuple[set, set]:
     # a failing test stops at its first failing pair: the pool tasks of the
     # pairs after it never run (inline.py)
     inline.LAZY = os.environ.get("BR_LAZYPOOL", "1") == "1"
+    if os.environ.get("BR_HOTFIRST", "1") == "1":
+        inline.HOT = frozenset(HOT_NAMES)
     inline.install()
     if XFAST and FARM[0] and "tests.test_executor" in sys.modules:
         # TestExecutor's set-up from the stored rows, when every file they
@@ -2717,6 +2720,11 @@ def child_main(plan: Plan, wfd: int) -> None:
         _ph("start")
         root = build_farm(plan.cid, plan.files)
         FARM[0] = root
+        for _rel in plan.files:
+            _p = _rel[:-3].split("/") if _rel.endswith(".py") else []
+            if len(_p) == 3 and _p[0] == "sqlglot" and _p[1] in ("dialects", "generators", "parsers", "typing") \
+                    and _p[2] not in ("dialect", "__init__"):
+                HOT_NAMES.add(_p[2])  # a dialect's own file: its fixture pairs are checked first (inline.py)
         pre = bool(getattr(plan, "preloaded", False)) and rebase_core(root)
         if not pre:
             purge_sqlglot()  # import it fresh from the farm
