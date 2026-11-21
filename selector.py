@@ -24,10 +24,12 @@ no table from patches or kinds of edit to failing tests.
 
 from __future__ import annotations
 
+import gc
 import gzip
 import itertools
 import json
 import os
+import select
 import signal
 import sys
 import time
@@ -2381,6 +2383,9 @@ def child_main(plan: Plan, wfd: int) -> None:
     result: dict = {"cid": plan.cid}
     os.dup2(2, 1)  # tests may print: never let a child write to our stdout
     cap_memory()
+    # importing sqlglot and fingerprinting it leave almost no cyclic garbage:
+    # no collector passes until something runs sqlglot (tests, TPC checks)
+    gc.disable()
     try:
         _ph("start")
         root = build_farm(plan.cid, plan.files)
@@ -2415,6 +2420,7 @@ def child_main(plan: Plan, wfd: int) -> None:
             cands.add(extra, P_ATTR)
             _ph("snap")
             result["diff"] = {"attrs": d["attrs"][:50], "globals": d["globals"][:50], "errors": d["errors"][:5], "n": len(extra)}
+        gc.enable()
         if everything:
             result["select"] = sorted(ALL)
             result["verified"] = 0
@@ -2617,8 +2623,6 @@ def _main(st: dict) -> None:
     outputs: dict[str, dict] = st["outputs"]
     max_par = int(os.environ.get("BR_PAR", "2"))
     if os.environ.get("BR_GCFREEZE", "1") == "1":
-        import gc
-
         gc.collect()
         gc.freeze()  # children: no GC pass over the parent's objects (copy-on-write)
     queue = list(jobs)
@@ -2664,8 +2668,14 @@ def _main(st: dict) -> None:
         if pid not in running:
             continue
         cid, r, t_start = running.pop(pid)
+        try:
+            os.killpg(pid, signal.SIGKILL)  # whatever the child left running in its group
+        except OSError:
+            pass
         buf = b""
-        while True:
+        # the child has exited, so its answer is already in the pipe; a process
+        # it left outside its group may still hold the write end open
+        while select.select([r], [], [], 1.0)[0]:
             chunk = os.read(r, 65536)
             if not chunk:
                 break
