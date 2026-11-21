@@ -2956,6 +2956,11 @@ def _main(st: dict) -> None:
     running: dict[int, tuple[str, int, float]] = st["running"]
     outputs: dict[str, dict] = st["outputs"]
     max_par = int(os.environ.get("BR_PAR", "2"))
+    # One child at a time while the batch is on schedule: two children on
+    # the scorer's two CPUs (often two threads of one core) each run slower,
+    # and CPU seconds are what is scored. Past PAR_AFTER seconds (children
+    # that hang or time out) it goes back to max_par at once.
+    par_after = float(os.environ.get("BR_PAR_AFTER", "30"))
     if os.environ.get("BR_GCFREEZE", "1") == "1":
         gc.collect()
         gc.freeze()  # children: no GC pass over the parent's objects (copy-on-write)
@@ -2963,7 +2968,7 @@ def _main(st: dict) -> None:
     # hard wall-clock watchdog: the whole batch must finish inside the limit
     child_limit = float(os.environ.get("BR_CHILD_LIMIT", "45"))
     while queue or running:
-        while queue and len(running) < max_par and time.time() - T0 < budget:
+        while queue and len(running) < (1 if time.time() - T0 < par_after else max_par) and time.time() - T0 < budget:
             cid = queue.pop(0)
             if cid in pre and "core" not in st:
                 st["core"] = preload_core()
