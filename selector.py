@@ -53,12 +53,16 @@ SNAP_OVH = float(os.environ.get("BR_SNAP_OVH", "1.2"))
 VERIFY = os.environ.get("BR_VERIFY", "1") == "1"
 # prior chance that a candidate test actually fails, by why it is a candidate
 P_DATA = float(os.environ.get("BR_P_DATA", "0.9"))
-P_CODE = float(os.environ.get("BR_P_CODE", "0.15"))
-P_ATTR = float(os.environ.get("BR_P_ATTR", "0.15"))
+P_CODE = float(os.environ.get("BR_P_CODE", "0.2"))
+P_ATTR = float(os.environ.get("BR_P_ATTR", "0.2"))
 P_TEST = float(os.environ.get("BR_P_TEST", "0.5"))
 P_LOW = 0.05
 DEBUG = os.environ.get("BR_DEBUG", "0") == "1"
 PRELOAD = os.environ.get("BR_PRELOAD", "1") == "1"
+# rows TestExecutor's class set-up parses from the TPC tables, stored at build time (xsetup.py)
+XCACHE = os.environ.get("BR_XCACHE", os.path.join(APP, "xcache.bin"))
+XFAST = os.environ.get("BR_XFAST", "1") == "1" and os.path.exists(XCACHE)
+FARM: list = [None]  # a child's patched tree
 
 for _v in ("OPENBLAS_NUM_THREADS", "OMP_NUM_THREADS", "MKL_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
     os.environ.setdefault(_v, "1")
@@ -2429,6 +2433,16 @@ def run_tests(nums: list[int], split: dict | None = None) -> tuple[set, set]:
     import inline
 
     inline.install()
+    if XFAST and FARM[0] and "tests.test_executor" in sys.modules:
+        # TestExecutor's set-up from the stored rows, when every file they
+        # depend on is the pinned one (xsetup.py); else the original runs
+        try:
+            import xsetup
+
+            if xsetup.install(FARM[0], PRISTINE, XCACHE) and DEBUG:
+                PROF.append(("xfast", 0, 0))
+        except Exception:  # noqa: BLE001
+            pass
     if split:
         # (a query-looping TPC test that must run whole shares the class
         # attribute, so cut no TPC query list in that case)
@@ -2674,6 +2688,7 @@ def child_main(plan: Plan, wfd: int) -> None:
     try:
         _ph("start")
         root = build_farm(plan.cid, plan.files)
+        FARM[0] = root
         pre = bool(getattr(plan, "preloaded", False)) and rebase_core(root)
         if not pre:
             purge_sqlglot()  # import it fresh from the farm

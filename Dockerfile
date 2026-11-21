@@ -13,6 +13,7 @@ COPY *.py /app/
 COPY maps /app/maps
 RUN cd /opt/sqlglot && SKIP_INTEGRATION=0 PYTHONHASHSEED=0 python /app/mksnap.py /opt/sqlglot /app/snap.json \
  && python /app/prep.py /app/maps/maps.json.gz /app/maps/maps.bin \
+ && SKIP_INTEGRATION=0 PYTHONHASHSEED=0 python /app/mkxcache.py /opt/sqlglot /app/xcache.bin \
  && python -m compileall -q -j 4 /opt/sqlglot /app /usr/local/lib/python3.13 >/dev/null 2>&1; \
     chmod -R a+rX /opt/sqlglot /app
 

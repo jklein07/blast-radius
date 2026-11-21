@@ -174,7 +174,7 @@ them across workers.
    fail. Expensive ones are kept unverified when that is cheaper. The cost
    model uses each test's measured CPU and its class setup, and a prior
    chance that a candidate fails (one constant per kind of reason it was
-   chosen: 0.15 for code and import-time state, 0.5 for test-side changes,
+   chosen: 0.2 for code and import-time state, 0.5 for test-side changes,
    0.9 for data files). Every verified
    test runs under its own timer (three times its measured cost plus a
    margin; 15 s for class setup); a test that runs out of time is kept,
@@ -185,6 +185,14 @@ them across workers.
    child stops it once it holds 1.3 GB more than at the fork (address space
    is capped too, far above that), and that commit keeps every candidate, so
    two children never take the container past its memory limit.
+   `TestExecutor`'s class setup parses sixteen TPC CSV files in pure Python
+   (about 1 s of CPU) before any of its tests can run. Only the test file,
+   `tests/helpers.py`, the CSV bytes and the standard library decide the
+   rows it builds, so the image build runs it once on the pinned commit and
+   stores them (`mkxcache.py`, which checks that the stored path rebuilds
+   identical class state). A child uses them only when every one of those
+   files in its tree is the pinned one; it still builds each `Table` with
+   the patched class, and opens the duckdb views at first use.
    Importing the patched code has a CPU-time limit: 5 s for sqlglot (the
    snapshot; the slowest normal case takes 1.2 s) and 8 s for the test
    modules before verifying. Some modules parse SQL while they import,
@@ -239,6 +247,7 @@ references).
 | `fingerprint.py` | Import-time state fingerprints and diff |
 | `patchapply.py` | Unified-diff parser and applier (stdlib only) |
 | `inline.py` | In-process ProcessPoolExecutor with pickle round trips |
+| `xsetup.py`, `mkxcache.py` | `TestExecutor`'s class setup from rows stored at image build (`xcache.bin`) |
 | `tracer.py`, `modlines.py`, `build_maps.py`, `mksnap.py` | Build-time tools that produce `maps/maps.json.gz` and `snap.json` from the pinned commit |
 | `wmtrace.py`, `build_wm.py` | Build-time: comparison-swap profile, `maps/wm.json.gz` |
 | `bwtrace.py`, `build_bw.py` | Build-time: and/or-swap profile, `maps/bw.json.gz` |
