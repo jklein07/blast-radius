@@ -1272,6 +1272,11 @@ def snapshot_candidates(pristine: dict, patched: dict, diff: dict, plan: Plan) -
     for mod, name in diff["globals"]:
         if name == "__doc__":
             continue
+        if mod == "sqlglot.expressions" and name == "EXPR_CLASSES" and expr_registry_grew(pristine, diff, plan):
+            sid = MODATTR.get(f"{mod}|__dict__")
+            if sid is not None:
+                out.update(SETS[sid])
+            continue  # new classes no generator can dispatch to
         out |= global_ref_tests(mod, name)
         if name == "*":  # the module is gone (or new)
             out |= import_site_tests(mod, True)
@@ -1314,6 +1319,90 @@ def snapshot_candidates(pristine: dict, patched: dict, diff: dict, plan: Plan) -
 
 
 _LIVE: dict = {}
+
+
+def _mention_sites(word: str) -> list:
+    """(path, line number, line) of every whole-word occurrence of word in the
+    files of the pristine checkout a test run can import or read."""
+    import re
+
+    pat = re.compile(rb"(?<![A-Za-z0-9_])" + re.escape(word.encode()) + rb"(?![A-Za-z0-9_])")
+    out = []
+    for dp, dns, fns in os.walk(PRISTINE):
+        dns[:] = [d for d in dns if d not in (".git", "__pycache__") and not (dp == PRISTINE and d in _NOT_RUN)]
+        for fn in fns:
+            if dp == PRISTINE and fn.endswith((".md", ".png")):
+                continue
+            path = os.path.join(dp, fn)
+            try:
+                with open(path, "rb") as fh:
+                    data = fh.read()
+            except OSError:
+                return [(None, 0, b"")]
+            if word.encode() not in data:
+                continue
+            for i, ln in enumerate(data.split(b"\n"), 1):
+                if pat.search(ln):
+                    out.append((os.path.relpath(path, PRISTINE), i, ln))
+    return out
+
+
+def expr_registry_grew(pristine: dict, diff: dict, plan: Plan) -> bool:
+    """Whether the change to sqlglot.expressions.EXPR_CLASSES (expression key
+    -> class) is only new keys of new classes, which no test can feel through
+    it. Its one reader is generator._build_dispatch; new keys only add
+    dispatch entries keyed by the new classes, consulted only to generate a
+    node of a new class. A test gets such a node only through another changed
+    lookup (the parser's FUNCTIONS, FUNCTION_BY_NAME, ALL_FUNCTIONS, the new
+    module names, changed code), each charged on its own. Old classes keep
+    their keys, and none is displaced by a new class with the same key."""
+    if "sqlglot/generator.py" in plan.files or "sqlglot/expressions/__init__.py" in plan.files:
+        return False
+    if any(a == "key" for _, a in diff["attrs"]):
+        return False
+    span = M["defs"].get("sqlglot/generator.py", {}).get("_build_dispatch")
+    if not span:
+        return False
+    for rel, ln, text in _mention_sites("EXPR_CLASSES"):
+        if rel == "sqlglot/generator.py" and span[0] <= ln <= span[1]:
+            continue
+        if rel == "sqlglot/expressions/__init__.py" and text.startswith(b"EXPR_CLASSES"):
+            continue
+        return False
+    if any(t and "EXPR_CLASSES" in t for t in plan.files.values()):
+        return False
+    try:
+        from sqlglot import exp
+    except Exception:  # noqa: BLE001
+        return False
+    if not _LIVE:
+        import fingerprint
+
+        _LIVE.update(dict(fingerprint.iter_classes(sorted(sys.modules), "sqlglot")))
+    pcl = pristine.get("classes") or {}
+    rev = {id(v): k for k, v in _LIVE.items()}
+    reg = getattr(exp, "EXPR_CLASSES", None)
+    if not isinstance(reg, dict):
+        return False
+    new = {}
+    for k, c in reg.items():
+        fk = rev.get(id(c))
+        if fk is None:
+            return False
+        if fk not in pcl:
+            new[k] = c
+    if not new:
+        return False
+    try:
+        for fk, c in _LIVE.items():
+            if fk in pcl and isinstance(c, type) and issubclass(c, exp.Expr) and getattr(c, "key", None) in new:
+                return False  # an old class's key now maps to a new class
+        for fk in pcl:
+            if fk.startswith("sqlglot.expressions") and fk not in _LIVE:
+                return False  # a class is gone: its key may be too
+    except Exception:  # noqa: BLE001
+        return False
+    return True
 
 
 def fresh_member(key: str, attr: str, plan: Plan, pristine: dict) -> bool:

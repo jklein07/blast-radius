@@ -74,6 +74,13 @@ them across workers.
    that attribute through the class or a subclass. The tracer records those
    reads by wrapping every class attribute in a recording descriptor. Each
    changed global maps to the tests that execute a line referring to it.
+   One registry gets a closer look: a new expression class adds a key to
+   `exp.EXPR_CLASSES`, which every test that builds a generator reads (in
+   `_build_dispatch`). When the only change to it is new keys for new
+   classes, it charges nothing. The new dispatch entries are keyed by the new
+   classes, so they matter only for nodes of those classes, and a test can
+   only get such a node through another changed lookup (the parser's
+   `FUNCTIONS`, `FUNCTION_BY_NAME`, the new names), each charged on its own.
 4. **Operator swaps → value profile.** When the only difference in a
    comparison is its operator (`is` for `==`, `<` for `<=`, `is not` for `!=`,
    ...), executing the line is not enough to change anything: the new
