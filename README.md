@@ -39,7 +39,9 @@ them across workers.
 5. **Query-level verification for the TPC tests.** `test_execute_tpcds`
    and its TPC-H siblings loop over a fixture's queries. `qtrace.py` records
    which queries execute each line. When a change reaches only some of them,
-   the test can be verified on those queries alone.
+   the test can be verified on those queries alone. The optimizer tests that
+   check a rule against a fixture file get the same treatment per fixture
+   pair (`cftrace.py`, `cfsel.py`).
 6. **Data files → file reads.** SQL fixtures and other files map to the tests
    that opened them (or whose module opened them while importing).
 7. **Verify cheap candidates.** Candidates that cost little to run are run on
@@ -70,6 +72,7 @@ references).
 | `tracer.py`, `modlines.py`, `build_maps.py`, `mksnap.py` | Build-time tools that produce `maps/maps.json.gz` and `snap.json` from the pinned commit |
 | `wmtrace.py`, `build_wm.py` | Build-time: comparison-swap profile, `maps/wm.json.gz` |
 | `qtrace.py`, `build_split.py` | Build-time: per-query coverage of the TPC tests, `maps/split.json.gz` |
+| `cftrace.py`, `build_cf.py`, `cfsel.py` | Per-pair coverage of the fixture-driven optimizer tests, `maps/cf.json.gz`; `cfsel.py` runs such a test on chosen pairs |
 
 ## Rebuilding the maps
 
@@ -83,6 +86,8 @@ PYTHONHASHSEED=0 python wmtrace.py /opt/sqlglot tests.json out/wm 8
 python build_wm.py tests.json out/wm out/calib maps/wm.json.gz
 PYTHONHASHSEED=0 python qtrace.py /opt/sqlglot out/qtrace.json 4
 python build_split.py out/qtrace.json maps/split.json.gz
+PYTHONHASHSEED=0 python cftrace.py /opt/sqlglot out/cftrace 10
+python build_cf.py out/cftrace maps/cf.json.gz
 ```
 
 ## Third-party code

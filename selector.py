@@ -355,24 +355,12 @@ def fe_maps() -> dict:
     return _FE
 
 
-def split_queries(n: int, plan) -> tuple | None:
-    """(attr, query indexes, nq, CPU cost, mode) when test n can be verified
-    on only the queries that execute a changed line; None when it must run
-    whole. mode "fe": every changed line it runs belongs to its front end
-    (parse, optimize, plan, transpile), so comparing those artifacts with the
-    pinned commit's decides it (tpcfp.py); mode "run": run those queries."""
-    tid = SPLIT_NUMS.get(n)
-    if tid is None or n in plan.cands.other:
-        return None
-    sm_all = split_maps()
-    sm = sm_all.get("tests", {}).get(tid)
-    if not sm:
-        return None
-    setup = sm_all.get("setup", {})
+def changed_hits(n: int, plan) -> dict | None:
+    """{sqlglot file: lines in test n's coverage that the changes reach}, or
+    None when a change reaches it in a way no line map covers (import time,
+    a deleted or unparsable module): then it must run whole."""
     tfile = FILE_OF[n]
-    fe = fe_maps().get(tid)
-    fe_ok = fe is not None
-    q = 0
+    out: dict = {}
     for rel, ch in plan.py_changes.items():
         if not rel.startswith("sqlglot/") or not ch.semantic:
             continue
@@ -408,6 +396,34 @@ def split_queries(n: int, plan) -> tuple | None:
             for ln, sid in fm.items():
                 if first <= abs(ln) <= last and n in SETS[sid]:
                     hit.add(ln)
+        if hit:
+            out[rel] = hit
+    return out
+
+
+def split_queries(n: int, plan) -> tuple | None:
+    """(attr, query indexes, nq, CPU cost, mode) when test n can be verified
+    on only the queries that execute a changed line; None when it must run
+    whole. mode "fe": every changed line it runs belongs to its front end
+    (parse, optimize, plan, transpile), so comparing those artifacts with the
+    pinned commit's decides it (tpcfp.py); mode "run": run those queries."""
+    if n in CF_NUMS:
+        return cf_pairs(n, plan)
+    tid = SPLIT_NUMS.get(n)
+    if tid is None or n in plan.cands.other:
+        return None
+    sm_all = split_maps()
+    sm = sm_all.get("tests", {}).get(tid)
+    if not sm:
+        return None
+    setup = sm_all.get("setup", {})
+    fe = fe_maps().get(tid)
+    fe_ok = fe is not None
+    hits = changed_hits(n, plan)
+    if hits is None:
+        return None
+    q = 0
+    for rel, hit in hits.items():
         su = set(setup.get(rel, ()))
         lm = sm["lines"].get(rel, {})
         ex = fe["_exec"].get(rel, ()) if fe_ok else ()
@@ -433,10 +449,74 @@ def split_queries(n: int, plan) -> tuple | None:
     return sm["attr"], idx, nq, round(cost, 3), "run"
 
 
+# Fixture-pair verification of the optimizer tests that check a rule against
+# a fixture file (check_file, test_annotate_types, test_annotate_funcs).
+# maps/cf.json.gz (cftrace.py) records which pairs run each line and which
+# lines run outside the pairs; cfsel.py cuts a run down to chosen pairs.
+CF_PREFIX = "tests/test_optimizer.py::TestOptimizer::"
+CF_NUMS = {t["number"]: t["id"][len(CF_PREFIX):] for t in TESTS if t["id"].startswith(CF_PREFIX)}
+if os.environ.get("BR_NOCF") == "1":
+    CF_NUMS = {}
+_CF = None
+
+
+def cf_maps() -> dict:
+    global _CF
+    if _CF is None:
+        try:
+            with gzip.open(os.path.join(os.path.dirname(MAPS), "cf.json.gz"), "rt") as fh:
+                _CF = json.load(fh)
+        except Exception:  # noqa: BLE001
+            _CF = {}
+    return _CF
+
+
+def cf_pairs(n: int, plan) -> tuple | None:
+    """("@cf", pair indexes, pair count, CPU cost, "run") when test n can be
+    verified on only the fixture pairs that execute a changed line (none,
+    when only its own code outside the pairs does); None to run it whole."""
+    m = CF_NUMS.get(n)
+    if m is None or n in plan.cands.other:
+        return None
+    cm = cf_maps()
+    t = cm.get("tests", {}).get(m)
+    if not t:
+        return None
+    hits = changed_hits(n, plan)
+    if not hits:
+        return None
+    setup = cm.get("setup", {})
+    masks = t["masks"]
+    q = 0
+    for rel, hit in hits.items():
+        su = set(setup.get(rel, ()))
+        lm = t["lines"].get(rel, {})
+        outside = set(t["outside"].get(rel, ()))
+        for l in hit:
+            if l in su:
+                return None  # setUpClass runs it
+            j = lm.get(str(l))
+            if j is None:
+                if l in outside:
+                    continue  # the test's own code runs it, whichever pairs run
+                return None  # the test runs it, but no traced run did
+            q |= int(masks[j], 16)
+    nq = t["nq"]
+    if q == (1 << nq) - 1:
+        return None
+    idx = [i for i in range(nq) if q >> i & 1]
+    pc, cx = t["pc"], t["cx"]
+    est = t["fixed"] + (t["c1"] + sum(pc[i] for i in idx) + max(cx[i] for i in idx) if idx else 0.0)
+    # in the calibrated units of the whole test's verification cost
+    full = vcost(n)
+    cost = full * min(1.0, est / t["full"]) if t["full"] > 0 else full
+    return "@cf", idx, nq, round(cost, 4), "run"
+
+
 def split_plan(plan, cands=None) -> dict:
     cands = plan.cands if cands is None else cands
     out = {}
-    for n in SPLIT_NUMS:
+    for n in list(SPLIT_NUMS) + sorted(n for n in cands if n in CF_NUMS):
         if n in cands and n not in cands.other:
             r = split_queries(n, plan)
             if r is not None:
@@ -526,9 +606,9 @@ def choose_verify(cands: dict, already_forked: bool, split: dict | None = None) 
     # The query-looping TPC tests dominate a schedule they are in, but come
     # last in the cheap-first order above. Also price verifying them always,
     # plus a cheap-first prefix of the rest.
-    B = [n for n in free if n in split]
+    B = [n for n in free if n in split and n in SPLIT_NUMS]
     if B:
-        nb = [n for n in free if n not in split]
+        nb = [n for n in free if n not in B]
         m2 = len(nb)
         pre = [0.0]
         pn = [1.0]
@@ -692,6 +772,13 @@ def analyze(cid: str, text: str) -> Plan:
             for r in rels:
                 if r.endswith(".py") and r.startswith("sqlglot/"):
                     plan.need_snapshot = True
+    # The spawners (test_lazy_load) run `import sqlglot` in a fresh
+    # interpreter and check what it registered. Only code that runs while
+    # sqlglot imports can change that, and every such change needs the
+    # import-time snapshot (module level, import statements, functions run
+    # at import time, syntax errors, deleted, new or renamed modules).
+    if plan.need_snapshot and any(r.startswith("sqlglot/") for r in plan.files):
+        plan.cands.add(SPAWNERS, P_LOW)
     return plan
 
 
@@ -827,7 +914,6 @@ def runtime_tests(rel: str, ch: astdiff.PyChange, old_src) -> set:
 
 
 def sqlglot_change(plan: Plan, rel: str, ch: astdiff.PyChange, old_src=None) -> None:
-    plan.cands.add(SPAWNERS, P_LOW)
     if ch.syntax_error:
         plan.need_snapshot = True  # the import error decides
         return
@@ -1214,10 +1300,33 @@ def _on_alarm(*_):
     raise _Timeout()
 
 
-def _apply_split(split: dict) -> None:
-    """Cut the query lists setUpClass loads down to the queries to verify."""
+def _apply_split(split: dict, tpc: bool = True) -> None:
+    """Cut the query lists setUpClass loads down to the queries to verify,
+    and the optimizer tests' fixture loads down to the pairs to verify."""
     by_cls: dict = {}
+    cf = {n: v for n, v in split.items() if v[0] == "@cf"}
+    if cf:
+        mod = sys.modules.get("tests.test_optimizer")
+        t = cf_maps().get("tests", {})
+        if mod is not None and hasattr(mod, "load_sql_fixture_pairs"):
+            import cfsel
+
+            cfsel.install(mod)
+            for n, (_a, idx, nq, _c, _m) in cf.items():
+                ent = t.get(CF_NUMS[n])
+                if ent is None or ent["nq"] != nq:
+                    continue  # runs whole
+                keep: dict = {}
+                off = 0
+                for k, (fn, cnt) in enumerate(ent["loads"]):
+                    keep[k] = (fn, cnt, {i - off for i in idx if off <= i < off + cnt})
+                    off += cnt
+                cfsel.KEEP[CF_NUMS[n]] = keep
+    if not tpc:
+        return
     for n, (attr, idx, nq, _c, _m) in split.items():
+        if attr == "@cf":
+            continue
         parts = TESTS_BY_NUM[n]["id"].split("::")
         mod = sys.modules.get(FILE_OF[n][:-3].replace("/", "."))
         cls = getattr(mod, parts[1], None) if mod is not None and len(parts) > 2 else None
@@ -1282,10 +1391,10 @@ def run_tests(nums: list[int], split: dict | None = None) -> tuple[set, set]:
     import inline
 
     inline.install()
-    if split and not any(n in SPLIT_NUMS and n not in split for n in nums):
-        # (a query-looping test that must run whole shares the class
-        # attribute, so cut nothing in that case)
-        _apply_split(split)
+    if split:
+        # (a query-looping TPC test that must run whole shares the class
+        # attribute, so cut no TPC query list in that case)
+        _apply_split(split, tpc=not any(n in SPLIT_NUMS and n not in split for n in nums))
     for items, suite in suites:
         res = R()
         try:
@@ -1520,6 +1629,8 @@ def child_main(plan: Plan, wfd: int) -> None:
                 result["split"] = {str(n): [len(v[1]), v[3], v[4], n in failing] + ([len(fe_runs[n][1])] if n in fe_runs else []) for n, v in vsplit.items()}
             result["select"] = sorted(set(include) | failing)
             result["verified"] = len(verify)
+            if DEBUG:
+                result["vlist"] = sorted(verify)
             result["failing_verified"] = sorted(failing)
             result["cands"] = len(cands)
     except BaseException as e:  # noqa: BLE001
