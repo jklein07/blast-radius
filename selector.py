@@ -2488,28 +2488,97 @@ def child_main(plan: Plan, wfd: int) -> None:
 
 
 # ------------------------------------------------------------------------ main
+class _ParentTimeout(BaseException):
+    pass
+
+
+def _parent_alarm(signum, frame):
+    raise _ParentTimeout()
+
+
+ANALYZE_LIMIT = float(os.environ.get("BR_ANALYZE_LIMIT", "20"))
+
+
 def main() -> None:
+    """Whatever goes wrong in this process (an error, a patch that keeps the
+    analysis busy, the batch running out of time), every commit still gets
+    exactly one line on stdout: the selection made so far, or a safe one."""
+    st: dict = {"commits": None, "plans": {}, "selections": {}, "outputs": {}, "printed": set(), "running": {}}
+    signal.signal(signal.SIGALRM, _parent_alarm)
+    try:
+        _main(st)
+    except BaseException as e:  # noqa: BLE001
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        log("parent error, printing safe selections:", repr(e)[:300])
+        for cpid in list(st["running"]):
+            for kill in (os.killpg, os.kill):
+                try:
+                    kill(cpid, signal.SIGKILL)
+                except OSError:
+                    pass
+        commits = st["commits"]
+        if commits is None:
+            commits = sorted(p[:-6] for p in os.listdir(os.path.join(DATA, "commits")) if p.endswith(".patch"))
+        for cid in commits:
+            if cid in st["printed"]:
+                continue
+            sel = st["selections"].get(cid)
+            o = st["outputs"].get(cid)
+            p = st["plans"].get(cid)
+            if sel is None and o and "select" in o and "error" not in o:
+                sel = o["select"]
+            if sel is None:
+                sel = sorted(p.cands) if p is not None and not p.need_snapshot and not p.all_tests else list(ALL)
+            try:
+                workers = schedule(sel)
+            except BaseException:  # noqa: BLE001
+                u = sorted(set(sel) & set(ALL))
+                workers = [w for w in (u[i::8] for i in range(8)) if w]
+            sys.stdout.write(json.dumps({"commit": cid, "workers": workers}) + "\n")
+            sys.stdout.flush()
+            st["printed"].add(cid)
+
+
+def _main(st: dict) -> None:
     commits = sorted(p[:-6] for p in os.listdir(os.path.join(DATA, "commits")) if p.endswith(".patch"))
+    st["commits"] = commits
     n = len(commits)
     # wall-clock limits: 3 minutes for practice (40 commits), 4.5 for the final
     # (about 60); only local benchmarks far larger than either scale them up
     scale = max(1.0, n / (40 if n <= 45 else 60)) if n > 120 else 1.0
     budget = float(os.environ.get("BR_BUDGET", 0)) or (150.0 if n <= 45 else 235.0) * scale
-    plans: dict[str, Plan] = {}
+    plans: dict[str, Plan] = st["plans"]
+    hard = float(os.environ.get("BR_HARD", 0)) or (168.0 if n <= 45 else 258.0) * scale
     for cid in commits:
         with open(os.path.join(DATA, "commits", cid + ".patch"), encoding="utf-8", errors="surrogateescape", newline="") as fh:
             text = fh.read()
+        # a patch that keeps the analysis busy gets every test, not the batch's time
+        left = hard - 20.0 - (time.time() - T0)
         try:
-            plans[cid] = analyze(cid, text)
+            if left < 0.5:
+                raise _ParentTimeout()
+            signal.setitimer(signal.ITIMER_REAL, min(ANALYZE_LIMIT, left))
+            p = analyze(cid, text)
+            signal.setitimer(signal.ITIMER_REAL, 0)
+            plans[cid] = p
+        except _ParentTimeout:
+            signal.setitimer(signal.ITIMER_REAL, 0)
+            p = Plan(cid)
+            p.all_tests = True
+            p.notes.append("analyze timeout")
+            plans[cid] = p
         except Exception as e:  # noqa: BLE001
+            signal.setitimer(signal.ITIMER_REAL, 0)
             p = Plan(cid)
             p.all_tests = True
             p.notes.append(f"analyze error {e!r}")
             plans[cid] = p
     _ru = __import__("resource").getrusage(0)
     log(f"phase analyze cpu {_ru.ru_utime + _ru.ru_stime:.2f}")
-    selections: dict[str, list[int]] = {}
+    selections: dict[str, list[int]] = st["selections"]
     jobs = []
+    # past this the batch is out of time: main() prints what is known
+    signal.setitimer(signal.ITIMER_REAL, max(0.1, hard + 6.0 - (time.time() - T0)))
     for cid, p in plans.items():
         if UNKNOWN and (p.cands or p.need_snapshot):
             p.cands.add(UNKNOWN, P_LOW)
@@ -2544,8 +2613,8 @@ def main() -> None:
     log(f"phase preimport cpu {_ru.ru_utime + _ru.ru_stime:.2f}")
     # cheap first so a slow child cannot starve the rest
     jobs.sort(key=lambda c: (plans[c].need_snapshot, sum(SEC[x] for x in plans[c].cands)))
-    running: dict[int, tuple[str, int, float]] = {}
-    outputs: dict[str, dict] = {}
+    running: dict[int, tuple[str, int, float]] = st["running"]
+    outputs: dict[str, dict] = st["outputs"]
     max_par = int(os.environ.get("BR_PAR", "2"))
     if os.environ.get("BR_GCFREEZE", "1") == "1":
         import gc
@@ -2554,7 +2623,6 @@ def main() -> None:
         gc.freeze()  # children: no GC pass over the parent's objects (copy-on-write)
     queue = list(jobs)
     # hard wall-clock watchdog: the whole batch must finish inside the limit
-    hard = float(os.environ.get("BR_HARD", 0)) or (168.0 if n <= 45 else 258.0) * scale
     child_limit = float(os.environ.get("BR_CHILD_LIMIT", "45"))
     while queue or running:
         while queue and len(running) < max_par and time.time() - T0 < budget:
@@ -2595,7 +2663,7 @@ def main() -> None:
             continue
         if pid not in running:
             continue
-        cid, r, st = running.pop(pid)
+        cid, r, t_start = running.pop(pid)
         buf = b""
         while True:
             chunk = os.read(r, 65536)
@@ -2607,7 +2675,7 @@ def main() -> None:
             outputs[cid] = json.loads(buf.decode() or "{}")
         except Exception:  # noqa: BLE001
             outputs[cid] = {"error": "bad child output"}
-        outputs[cid]["secs"] = round(time.time() - st, 2)
+        outputs[cid]["secs"] = round(time.time() - t_start, 2)
     for cid in jobs:
         o = outputs.get(cid)
         p = plans[cid]
@@ -2617,9 +2685,12 @@ def main() -> None:
             # no answer from the child (error or out of time): fall back safely
             selections[cid] = list(ALL) if p.need_snapshot else sorted(p.cands)
             log(cid, "fallback", (o or {}).get("error", "no output")[-400:])
-    for cid in commits:
-        sel = selections.get(cid, list(ALL))
-        print(json.dumps({"commit": cid, "workers": schedule(sel)}), flush=True)
+    lines = [(cid, json.dumps({"commit": cid, "workers": schedule(selections.get(cid, list(ALL)))}) + "\n") for cid in commits]
+    signal.setitimer(signal.ITIMER_REAL, 0)
+    for cid, line in lines:
+        sys.stdout.write(line)  # one write per line: never half a line
+        sys.stdout.flush()
+        st["printed"].add(cid)
     if DEBUG:
         for cid in commits:
             p = plans[cid]

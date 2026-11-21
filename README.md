@@ -148,6 +148,12 @@ tests in any file. Imports, plain definitions,
 test classes, skip and `mock.patch` decorators and call-free constants are
 known not to.
 
+The main process guards itself the same way. A patch that keeps the analysis
+of one commit busy for 20 s gets every test for that commit. If anything in
+the main process raises, or the batch nears its time limit, every commit not
+yet printed still gets exactly one line: its selection so far, else every
+candidate, else every test.
+
 No answers are worked out ahead of time: there is no table from patches or
 kinds of edit to failing tests. The maps in `maps/` are built only from the
 pinned commit (coverage, attribute reads, file reads, imports, name
