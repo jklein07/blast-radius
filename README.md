@@ -76,7 +76,10 @@ them across workers.
    in its own frame when the lambda is called, so a change inside it is
    charged to the tests that ran the lambda's body lines, not every line of
    the statement around it (one entry of a dict holding dozens of lambdas,
-   say). Code that reads a lambda's code object instead of calling it is
+   say). Likewise an `except` clause's type and name are evaluated only
+   while an exception is matched against it, which fires that clause's own
+   line (not the `try` line), and its body runs only after that: a change
+   there is charged to the tests that ran the clause. Code that reads a lambda's code object instead of calling it is
    only `test_typing`, which also reads the source files it checks. `tracer.py` ran every
    test of the pinned commit in its own forked process with `sys.monitoring`
    and recorded the lines each one executed (process-pool work included; see

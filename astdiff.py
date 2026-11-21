@@ -200,6 +200,11 @@ class _Walker:
                 return
             if isinstance(a, ast.stmt):
                 stmt = a
+            elif isinstance(a, ast.ExceptHandler):
+                # its type and name are evaluated only while an exception is
+                # matched against it, which fires the `except` line (not the
+                # `try` line); its body runs only after that
+                stmt = a
             if isinstance(a, ast.BoolOp) and isinstance(b, ast.BoolOp) and self._swap is None and self._bswap is None:
                 fl = _bool_flip(a, b)
                 if fl is not None:
