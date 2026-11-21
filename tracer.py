@@ -148,7 +148,9 @@ class _TA:
 
 wrapped = 0
 class_keys: dict[int, str] = {}
-for key, c in fingerprint.iter_classes(sorted(sys.modules), "sqlglot"):
+# list first: wrapping replaces a class's nested classes (dialect Tokenizers ...)
+# in its __dict__, and a lazy walk would then never reach them
+for key, c in list(fingerprint.iter_classes(sorted(sys.modules), "sqlglot")):
     class_keys[id(c)] = key
     if CALIB or isinstance(c, enum.EnumMeta):
         continue

@@ -91,7 +91,7 @@ def exec_lines(tid):
                 lk.add((keys.get(id(t)) or f"{getattr(t, '__module__', '?')}:{getattr(t, '__qualname__', '?')}") + "|" + self.k)
             return self.v
 
-    for _key, c in fingerprint.iter_classes(sorted(sys.modules), "sqlglot"):
+    for _key, c in list(fingerprint.iter_classes(sorted(sys.modules), "sqlglot")):  # list first: see tracer.py
         keys[id(c)] = _key
         if isinstance(c, enum.EnumMeta):
             continue
