@@ -709,6 +709,69 @@ def module_of(rel: str) -> str:
     return m
 
 
+def _mentions(word: str, texts) -> bool:
+    """Whether word occurs as a whole word in any of texts or in any file of
+    the pristine checkout."""
+    import re
+
+    pat = re.compile(r"(?<![A-Za-z0-9_])" + re.escape(word) + r"(?![A-Za-z0-9_])")
+    if any(t is not None and pat.search(t) for t in texts):
+        return True
+    w = word.encode()
+    bpat = re.compile(pat.pattern.encode())
+    for dp, dns, fns in os.walk(PRISTINE):
+        dns[:] = [d for d in dns if d not in (".git", "__pycache__")]
+        for fn in fns:
+            try:
+                with open(os.path.join(dp, fn), "rb") as fh:
+                    data = fh.read()
+            except OSError:
+                return True
+            if w in data and bpat.search(data):
+                return True
+    return False
+
+
+def unreferenced_new_modules(fps) -> set:
+    """New sqlglot modules nothing can import: Python imports a module only
+    by its name, and every dynamic import in sqlglot and its tests builds that
+    name from text that appears somewhere (a dialect string, an attribute
+    name, a fixed table), or lists a folder (the tests that list folders are
+    known). So a new module whose name appears in no other file, old or
+    patched, and that no test can see by listing a folder, never runs."""
+    new = [fp for fp in fps if fp.is_new and not fp.is_binary and (fp.new_path or "").startswith("sqlglot/")
+           and fp.new_path.endswith(".py")]
+    if not new:
+        return set()
+    texts = {}
+    for fp in fps:
+        if fp.is_binary or fp.is_deleted or not fp.new_path:
+            continue
+        try:
+            old = read_pristine(fp.old_path) if fp.old_path and not fp.is_new else None
+            texts[fp.new_path] = patchapply.apply_to_text(old, fp)
+        except Exception:  # noqa: BLE001
+            return set()
+    out = set()
+    for fp in new:
+        rel = fp.new_path
+        parts = rel[:-3].split("/")
+        name = parts[-2] if parts[-1] == "__init__" else parts[-1]
+        d, listed = os.path.dirname(rel), False
+        while True:
+            listed = listed or d in DIRREADS
+            if not d:
+                break
+            d = os.path.dirname(d)
+        b = parts[-1]
+        if (listed or not name.isidentifier() or not os.path.isdir(os.path.join(PRISTINE, os.path.dirname(rel)))
+                or b.startswith("test") or b.endswith("_test") or b == "conftest"):  # pytest may collect those
+            continue
+        if not _mentions(name, [t for r, t in texts.items() if r != rel]):
+            out.add(rel)
+    return out
+
+
 def analyze(cid: str, text: str) -> Plan:
     plan = Plan(cid)
     try:
@@ -717,9 +780,13 @@ def analyze(cid: str, text: str) -> Plan:
         plan.all_tests = True
         plan.notes.append(f"unparseable patch {e}")
         return plan
+    skip_new = unreferenced_new_modules(fps)
     for fp in fps:
         old_rel = fp.old_path
         new_rel = fp.new_path
+        if new_rel in skip_new:
+            plan.notes.append(f"new module nothing imports {new_rel}")
+            continue
         rels = {r for r in (old_rel, new_rel) if r}
         if fp.is_binary:
             for r in rels:
@@ -809,10 +876,15 @@ def tests_reading(rel: str, listing: bool = False) -> set:
             for imp in TEST_IMPORTERS.get(tf, []):
                 out |= set(BY_FILE.get(imp, []))
     if listing:  # the set of files in a folder changes only on add/remove/rename
+        # (and so does every enclosing folder's, when it creates or empties a subfolder)
         d = os.path.dirname(rel)
-        sid = DIRREADS.get(d)
-        if sid is not None:
-            out.update(SETS[sid])
+        while True:
+            sid = DIRREADS.get(d)
+            if sid is not None:
+                out.update(SETS[sid])
+            if not d:
+                break
+            d = os.path.dirname(d)
     return out
 
 

@@ -23,6 +23,13 @@ them across workers.
    - *Moved definitions.* Undecorated functions with constant defaults and no
      annotations may swap places within a run of such definitions between
      identical statements, in a module or class body.
+   - *New modules nothing imports.* Python imports a module only by its name,
+     and every dynamic import in sqlglot and its tests builds that name from
+     text found somewhere (a dialect string, an attribute name, a fixed
+     table). A new module in an existing sqlglot folder whose name appears in
+     no other file, old or patched, and that no test sees by listing a folder,
+     never runs. Names pytest might collect (`test*`, `*_test`, `conftest`)
+     never count.
 2. **Runtime changes → line coverage.** A difference inside a function or
    lambda body only matters to tests that execute it. `tracer.py` ran every
    test of the pinned commit in its own forked process with `sys.monitoring`
