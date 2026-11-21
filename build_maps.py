@@ -280,6 +280,13 @@ if calib_dir:
             vcpu[str(num2local[t["number"]])] = r["cpu"]
             if r.get("spawned"):
                 spawners.append(num2local[t["number"]])
+vcpu_alt = {}  # a second calibration (another machine), selected at run time by BR_CALIB=alt
+calib_alt = os.environ.get("CALIB_ALT_DIR")
+if calib_alt:
+    for t in tests:
+        p = os.path.join(calib_alt, f"{t['number']}.json")
+        if os.path.exists(p):
+            vcpu_alt[str(num2local[t["number"]])] = json.load(open(p))["cpu"]
 import_lines = json.load(open(os.path.join(trace_dir, "_import_lines.json")))
 module_reads = json.load(open(os.path.join(trace_dir, "_module_reads.json")))
 module_lines = json.load(open(modlines_json)) if os.path.exists(modlines_json) else {}
@@ -303,6 +310,7 @@ maps = {
     "spawners": sorted(set(spawners)),
     "mod_imports": mod_imports,
     "vcpu": vcpu,
+    "vcpu_alt": vcpu_alt,
     # dict-valued class attributes recorded by key (tracer.py _RD)
     "kltags": json.load(open(os.path.join(trace_dir, "_kl_tags.json"))) if os.path.exists(os.path.join(trace_dir, "_kl_tags.json")) else [],
     "kl": {tag: {kid: sid(s) for kid, s in d.items()} for tag, d in kl.items()},

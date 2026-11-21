@@ -67,6 +67,13 @@ import astdiff  # noqa: E402
 import patchapply  # noqa: E402
 
 T0 = time.time()
+PROF: list = []  # (stage, user, sys) CPU in a verification child, debug runs only
+
+
+def _ph(stage: str) -> None:
+    if DEBUG:
+        t = os.times()
+        PROF.append((stage, round(t.user, 3), round(t.system, 3)))
 
 
 def log(*a):
@@ -192,10 +199,11 @@ NAMES = _Names(M["names"], M.get("name_files", []))  # module -> name -> [(file,
 TEST_IMPORTERS: dict = M["test_importers"]  # test module file -> [test files importing it, transitively]
 NOVERIFY = {_local2num[i] for i in M["noverify"] if _local2num[i] is not None}
 VCPU = {}
-for _i, _c in M.get("vcpu", {}).items():
+VSCALE = float(os.environ.get("BR_VSCALE", "1.0"))  # scorer CPU per calibrated CPU second
+for _i, _c in M.get("vcpu_alt" if os.environ.get("BR_CALIB") == "alt" and M.get("vcpu_alt") else "vcpu", {}).items():
     _n = _local2num[int(_i)]
     if _n is not None:
-        VCPU[_n] = _c
+        VCPU[_n] = _c * VSCALE
 SPAWNERS = {_local2num[i] for i in M.get("spawners", []) if _local2num[i] is not None}
 # dict-valued class attributes the tracer recorded by key (tracer.py _RD)
 KLTAGS = set(M.get("kltags", ()))
@@ -1165,6 +1173,7 @@ def run_tests(nums: list[int], split: dict | None = None) -> tuple[set, set]:
             except BaseException:  # noqa: BLE001
                 failing.add(n)
         suites.append((items, suite))
+    _ph("load")
     import inline
 
     inline.install()
@@ -1344,7 +1353,9 @@ def child_main(plan: Plan, wfd: int) -> None:
     result: dict = {"cid": plan.cid}
     os.dup2(2, 1)  # tests may print: never let a child write to our stdout
     try:
+        _ph("start")
         root = build_farm(plan.cid, plan.files)
+        _ph("farm")
         os.chdir(root)
         sys.path.insert(0, root)
         os.environ["SKIP_INTEGRATION"] = "0"
@@ -1362,6 +1373,7 @@ def child_main(plan: Plan, wfd: int) -> None:
             result["only"] = len(only) if only is not None else -1
             extra, everything = snapshot_candidates(pristine, patched, d, plan)
             cands.add(extra, P_ATTR)
+            _ph("snap")
             result["diff"] = {"attrs": d["attrs"][:50], "globals": d["globals"][:50], "errors": d["errors"][:5], "n": len(extra)}
         if everything:
             result["select"] = sorted(ALL)
@@ -1410,6 +1422,9 @@ def child_main(plan: Plan, wfd: int) -> None:
     _u = _r.getrusage(_r.RUSAGE_SELF)
     _c = _r.getrusage(_r.RUSAGE_CHILDREN)
     result["cpu"] = round(_u.ru_utime + _u.ru_stime + _c.ru_utime + _c.ru_stime, 3)
+    if DEBUG:
+        _ph("end")
+        result["prof"] = PROF
     data = (json.dumps(result) + "\n").encode()
     while data:
         k = os.write(wfd, data)
@@ -1474,6 +1489,11 @@ def main() -> None:
     running: dict[int, tuple[str, int, float]] = {}
     outputs: dict[str, dict] = {}
     max_par = int(os.environ.get("BR_PAR", "2"))
+    if os.environ.get("BR_GCFREEZE", "1") == "1":
+        import gc
+
+        gc.collect()
+        gc.freeze()  # children: no GC pass over the parent's objects (copy-on-write)
     queue = list(jobs)
     # hard wall-clock watchdog: the whole batch must finish inside the limit
     hard = float(os.environ.get("BR_HARD", 0)) or (168.0 if n <= 45 else 258.0) * max(1.0, n / (40 if n <= 45 else 60))
