@@ -535,9 +535,10 @@ def _permuted_imports(ba: list, bb: list) -> set:
     the same bindings to the same already-importable modules. Empty if none."""
     if len(ba) != len(bb):
         return set()
-    da = [_dump(x) for x in ba]
-    db = [_dump(x) for x in bb]
-    diff = [i for i in range(len(ba)) if da[i] != db[i]]
+    # only imports are dumped (a module's class bodies are large); any other
+    # statement that differs is the walker's to report as usual
+    imp = (ast.Import, ast.ImportFrom)
+    diff = [i for i in range(len(ba)) if (isinstance(ba[i], imp) or isinstance(bb[i], imp)) and _dump(ba[i]) != _dump(bb[i])]
     if not diff:
         return set()
     run = range(diff[0], diff[-1] + 1)
@@ -547,7 +548,7 @@ def _permuted_imports(ba: list, bb: list) -> set:
         if na is None or nb is None:
             return set()
         names += na
-    if len(names) != len(set(names)) or sorted(da[i] for i in run) != sorted(db[i] for i in run):
+    if len(names) != len(set(names)) or sorted(_dump(ba[i]) for i in run) != sorted(_dump(bb[i]) for i in run):
         return set()
     return set(run)
 
