@@ -53,8 +53,8 @@ SNAP_OVH = float(os.environ.get("BR_SNAP_OVH", "1.2"))
 VERIFY = os.environ.get("BR_VERIFY", "1") == "1"
 # prior chance that a candidate test actually fails, by why it is a candidate
 P_DATA = float(os.environ.get("BR_P_DATA", "0.9"))
-P_CODE = float(os.environ.get("BR_P_CODE", "0.2"))
-P_ATTR = float(os.environ.get("BR_P_ATTR", "0.2"))
+P_CODE = float(os.environ.get("BR_P_CODE", "0.15"))
+P_ATTR = float(os.environ.get("BR_P_ATTR", "0.15"))
 P_TEST = float(os.environ.get("BR_P_TEST", "0.5"))
 P_LOW = 0.05
 DEBUG = os.environ.get("BR_DEBUG", "0") == "1"
