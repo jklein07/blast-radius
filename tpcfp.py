@@ -142,3 +142,21 @@ def differing(tid: str, idx, expected: dict) -> list:
         if got != expected.get(str(i)):
             return [i]
     return []
+
+
+def differing_upto(tid: str, idx, expected: dict, cap: int):
+    """Every query of idx whose artifacts differ from `expected`, or None as
+    soon as more than `cap` do (or one cannot be computed)."""
+    attr, _ = TESTS[tid]
+    sqls = queries(attr)
+    out = []
+    for i in idx:
+        try:
+            got = artifacts(tid, i, sqls)
+        except Exception:  # noqa: BLE001
+            return None
+        if got != expected.get(str(i)):
+            out.append(i)
+            if len(out) > cap:
+                return None
+    return out

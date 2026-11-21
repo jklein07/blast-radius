@@ -1303,6 +1303,42 @@ def fe_check(vfe: dict) -> set:
     return failing
 
 
+FE_RUN_MAX = int(os.environ.get("BR_FE_RUN_MAX", "8"))
+
+
+def fe_check_queries(vfe: dict) -> tuple[set, dict]:
+    """Like fe_check, but when only a few queries differ, plan to run the test
+    on just those. Queries with equal artifacts behave as at the pinned commit
+    (the execution side is untouched: that is what made the test eligible),
+    so the test passes exactly when it passes on the differing ones.
+    Returns (failing, {test: split entry to run})."""
+    failing: set = set()
+    runs: dict = {}
+    try:
+        import tpcfp
+    except Exception:  # noqa: BLE001
+        return set(vfe), runs
+    for n, (attr, idx, nq, _c, _m) in vfe.items():
+        tid = SPLIT_NUMS[n]
+        fe = fe_maps().get(tid) or {}
+        try:
+            D = tpcfp.differing_upto(tid, idx, fe.get("arts", {}), FE_RUN_MAX)
+        except BaseException:  # noqa: BLE001
+            D = None
+        if D == []:
+            continue
+        sm = split_maps().get("tests", {}).get(tid)
+        if D is None or not sm or sm.get("nq") != nq or sm.get("attr") != attr:
+            failing.add(n)
+            continue
+        cost = sm["fixed"] + sum(sm["warm"][i] for i in D) + max(sm["cold"][i] - sm["warm"][i] for i in D)
+        if cost * KAPPA > 0.5 * MS[n] / 1000:
+            failing.add(n)
+            continue
+        runs[n] = (attr, sorted(D), nq, round(cost, 3), "run")
+    return failing, runs
+
+
 def child_main(plan: Plan, wfd: int) -> None:
     """Runs in a forked child. Writes one JSON object to wfd."""
     result: dict = {"cid": plan.cid}
@@ -1354,11 +1390,13 @@ def child_main(plan: Plan, wfd: int) -> None:
             vfe = {n: v for n, v in vsplit.items() if v[4] == "fe"}
             vrun = {n: v for n, v in vsplit.items() if v[4] != "fe"}
             rest = [n for n in verify if n not in vfe]
+            fe_failing, fe_runs = fe_check_queries(vfe) if vfe else (set(), {})
+            rest += sorted(fe_runs)
+            vrun = {**vrun, **fe_runs}
             failing, _ = run_tests(rest, vrun) if rest else (set(), set())
-            if vfe:
-                failing |= fe_check(vfe)
+            failing |= fe_failing
             if vsplit:
-                result["split"] = {str(n): [len(v[1]), v[3], v[4], n in failing] for n, v in vsplit.items()}
+                result["split"] = {str(n): [len(v[1]), v[3], v[4], n in failing] + ([len(fe_runs[n][1])] if n in fe_runs else []) for n, v in vsplit.items()}
             result["select"] = sorted(set(include) | failing)
             result["verified"] = len(verify)
             result["failing_verified"] = sorted(failing)
