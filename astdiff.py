@@ -165,6 +165,8 @@ class _Walker:
         db = [self._key(x, self.nl) for x in lb]
         if da == db:
             return
+        if isinstance(parent, (ast.Module, ast.ClassDef)) and _only_moved_defs(la, lb, da, db):
+            return
         sm = difflib.SequenceMatcher(a=da, b=db, autojunk=False)
         for tag, i1, i2, j1, j2 in sm.get_opcodes():
             if tag == "equal":
@@ -508,6 +510,55 @@ def _code_equal(ca, cb) -> bool:
         elif type(x) is not type(y) or repr(x) != repr(y):
             return False
     return True
+
+
+# --------------------------------------------------------------- moved defs
+def _movable(x) -> bool:
+    """A def whose definition evaluates nothing (no decorators, constant
+    defaults, no evaluated annotations): defining it earlier or later among
+    other such defs binds the same function to the same name."""
+    if not isinstance(x, (ast.FunctionDef, ast.AsyncFunctionDef)) or x.decorator_list or getattr(x, "type_params", None):
+        return False
+    a = x.args
+    if any(not isinstance(d, ast.Constant) for d in a.defaults + [d for d in a.kw_defaults if d is not None]):
+        return False
+    every = a.posonlyargs + a.args + a.kwonlyargs + [y for y in (a.vararg, a.kwarg) if y is not None]
+    return x.returns is None and all(y.annotation is None for y in every)
+
+
+def _only_moved_defs(la: list, lb: list, da: list, db: list) -> bool:
+    """A module or class body whose only change is the order of movable defs
+    between the same other statements (each name defined once per run). Only
+    the order of names in the namespace differs, which sqlglot never reads
+    (it looks names up, and lists members through sorted inspect.getmembers)."""
+    if len(la) != len(lb):
+        return False
+
+    def runs(stmts, keys):
+        fixed, out, cur = [], [], []
+        for x, k in zip(stmts, keys):
+            if _movable(x):
+                cur.append((k, x.name))
+            else:
+                out.append(cur)
+                cur = []
+                fixed.append(k)
+        out.append(cur)
+        return fixed, out
+
+    fa, ra = runs(la, da)
+    fb, rb = runs(lb, db)
+    if fa != fb or len(ra) != len(rb):
+        return False
+    moved = False
+    for x, y in zip(ra, rb):
+        if x == y:
+            continue
+        names = [n for _, n in x]
+        if sorted(x) != sorted(y) or len(names) != len(set(names)):
+            return False
+        moved = True
+    return moved
 
 
 # ----------------------------------------------------------- reordered imports
