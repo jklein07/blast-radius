@@ -42,6 +42,12 @@ KAPPA = float(os.environ.get("BR_KAPPA", "1.15"))  # CPU seconds per recorded te
 CHILD_OVH = float(os.environ.get("BR_OVH", "0.30"))  # CPU seconds to start a verification child
 SNAP_OVH = float(os.environ.get("BR_SNAP_OVH", "1.2"))
 VERIFY = os.environ.get("BR_VERIFY", "1") == "1"
+# prior chance that a candidate test actually fails, by why it is a candidate
+P_DATA = float(os.environ.get("BR_P_DATA", "0.9"))
+P_CODE = float(os.environ.get("BR_P_CODE", "0.35"))
+P_ATTR = float(os.environ.get("BR_P_ATTR", "0.35"))
+P_TEST = float(os.environ.get("BR_P_TEST", "0.5"))
+P_LOW = 0.05
 DEBUG = os.environ.get("BR_DEBUG", "0") == "1"
 
 for _v in ("OPENBLAS_NUM_THREADS", "OMP_NUM_THREADS", "MKL_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
@@ -72,21 +78,111 @@ BY_FILE: dict[str, list[int]] = {}
 for t in TESTS:
     BY_FILE.setdefault(t["file"], []).append(t["number"])
 
-with gzip.open(MAPS, "rt") as fh:
-    M = json.load(fh)
+_BIN = MAPS[: -len(".json.gz")] + ".bin" if MAPS.endswith(".json.gz") else MAPS + ".bin"
+if os.path.exists(_BIN):
+    import marshal
+
+    with open(_BIN, "rb") as fh:
+        M = marshal.load(fh)
+else:
+    with gzip.open(MAPS, "rt") as fh:
+        M = json.load(fh)
 _ids = M["tests"]  # map-local index -> test id
 _local2num = [NUM_BY_ID.get(i) for i in _ids]
-UNKNOWN = [n for n in ALL if n not in set(x for x in _local2num if x is not None)]
-SETS = [frozenset(_local2num[i] for i in s if _local2num[i] is not None) for s in M["sets"]]
-COV: dict = M["cov"]  # file -> {line: setid}
+_known = set(x for x in _local2num if x is not None)
+UNKNOWN = [n for n in ALL if n not in _known]
+_IDENTITY = all(_local2num[i] == i for i in range(len(_local2num)))
+
+
+import array as _array
+
+
+def _u16(b):
+    if isinstance(b, (bytes, bytearray)):
+        a = _array.array("H")
+        a.frombytes(b)
+        return a.tolist()
+    return b
+
+
+def _i32(b):
+    if isinstance(b, (bytes, bytearray)):
+        a = _array.array("i")
+        a.frombytes(b)
+        return a.tolist()
+    return b
+
+
+class _Sets:
+    """Test sets by id, decoded and translated to this run's test numbers on first use."""
+
+    def __init__(self, raw):
+        self.raw = raw
+        self.cache: dict = {}
+
+    def __getitem__(self, i):
+        v = self.cache.get(i)
+        if v is None:
+            xs = _u16(self.raw[i])
+            if not _IDENTITY:
+                xs = [_local2num[x] for x in xs if _local2num[x] is not None]
+            v = self.cache[i] = xs
+        return v
+
+
+class _Cov:
+    """file -> {line: set id}, decoded per file on first use."""
+
+    def __init__(self, raw):
+        self.raw = raw
+        self.cache: dict = {}
+
+    def get(self, f, default=None):
+        v = self.cache.get(f)
+        if v is None:
+            r = self.raw.get(f)
+            if r is None:
+                return default
+            if isinstance(r, dict):
+                v = {int(k): x for k, x in r.items()}
+            else:
+                xs = _i32(r)
+                v = dict(zip(xs[0::2], xs[1::2]))
+            self.cache[f] = v
+        return v
+
+    def __contains__(self, f):
+        return f in self.raw
+
+    def __getitem__(self, f):
+        return self.get(f)
+
+
+class _Names:
+    def __init__(self, raw, files):
+        self.raw = raw
+        self.files = files
+
+    def refs(self, mod, name):
+        r = self.raw.get(mod, {}).get(name)
+        if r is None:
+            return []
+        if isinstance(r, list):
+            return r
+        xs = _i32(r)
+        return [(self.files[a], b) for a, b in zip(xs[0::2], xs[1::2])]
+
+
+SETS = _Sets(M["sets"])
+COV = _Cov(M["cov"])  # file -> {line: setid}
 LK: dict = M["lk"]  # "classkey|attr" -> setid
 CLASSUSE: dict = M["classuse"]  # classkey -> setid
 READS: dict = M["reads"]  # path -> setid
 DIRREADS: dict = M.get("dirreads", {})
 MODREADS: dict = M["module_reads"]  # test file -> [paths read while importing]
 MODLINES: dict = M.get("module_lines", {})  # test file -> {sqlglot file: [lines run while importing]}
-IMPORT_LINES = {f: set(v) for f, v in M["import_lines"].items()}
-NAMES: dict = M["names"]  # module -> name -> [[file, line], ...]
+IMPORT_LINES = M["import_lines"]
+NAMES = _Names(M["names"], M.get("name_files", []))  # module -> name -> [(file, line), ...]
 TEST_IMPORTERS: dict = M["test_importers"]  # test module file -> [test files importing it, transitively]
 NOVERIFY = {_local2num[i] for i in M["noverify"] if _local2num[i] is not None}
 VCPU = {}
@@ -133,9 +229,9 @@ def cov_tests(path: str, lines) -> set:
     if not fm:
         return out
     for ln in lines:
-        sid = fm.get(str(ln))
+        sid = fm.get(ln)
         if sid is not None:
-            out |= SETS[sid]
+            out.update(SETS[sid])
     # tests whose module import (not the test itself) ran these lines
     for tf, files in MODLINES.items():
         ls = files.get(path)
@@ -152,7 +248,7 @@ def func_span_tests(path: str, first: int, last: int) -> set:
     for ln, sid in fm.items():
         li = int(ln)
         if first <= abs(li) <= last:
-            out |= SETS[sid]
+            out.update(SETS[sid])
     return out
 
 
@@ -184,19 +280,29 @@ def sched_cost_ms(nums) -> int:
     return max(sum(MS[n] for n in x) for x in b) + WORKER_MS * len(b)
 
 
-def choose_verify(cands: set, already_forked: bool) -> tuple[list[int], list[int]]:
-    """Split candidates into (verify, include) minimising estimated cost."""
+def choose_verify(cands: dict, already_forked: bool) -> tuple[list[int], list[int]]:
+    """Split candidates into (verify, include) minimising expected cost.
+
+    Verifying test i costs its CPU; it removes i from the schedule only if it
+    passes (probability 1 - p_i). Expected schedule cost is approximated as
+    P(all verified pass) * S(include) + P(some fail) * S(include + verified).
+    """
     if not VERIFY:
         return [], sorted(cands)
     fixed = sorted(n for n in cands if n in NOVERIFY)
-    free = sorted((n for n in cands if n not in NOVERIFY), key=lambda n: (vcost(n) + setup_cost(n) - SEC[n], n))
+    free = [n for n in cands if n not in NOVERIFY]
     if not free:
         return [], fixed
     ovh = 0.0 if already_forked else CHILD_OVH
-    # candidate split points: verify the k cheapest
-    ks = sorted({0, len(free)} | {int(len(free) * f) for f in (0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 0.95)} | set(range(min(len(free), 40))))
-    best = None
+
+    def key(n):
+        return ((vcost(n) + setup_cost(n)) / max(1e-3, 1.0 - cands[n]), n)
+
+    free.sort(key=key)
+    m = len(free)
+    ks = sorted({0, m} | {int(m * f) for f in (0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 0.95)} | set(range(min(m, 40))))
     prefix = [0.0]
+    pnone = [1.0]
     seen_cls: set = set()
     for n in free:
         extra = 0.0
@@ -205,8 +311,15 @@ def choose_verify(cands: set, already_forked: bool) -> tuple[list[int], list[int
             seen_cls.add(k_)
             extra = setup_cost(n)
         prefix.append(prefix[-1] + vcost(n) + extra)
+        pnone.append(pnone[-1] * (1.0 - cands[n]))
+    best = None
     for k in ks:
-        cost = (ovh if k else 0.0) + prefix[k] + sched_cost_ms(fixed + free[k:]) / 1000.0
+        if k == 0:
+            cost = sched_cost_ms(fixed + free) / 1000.0
+        else:
+            s_u = sched_cost_ms(fixed + free[k:]) / 1000.0
+            s_all = sched_cost_ms(fixed + free) / 1000.0
+            cost = ovh + prefix[k] + pnone[k] * s_u + (1.0 - pnone[k]) * s_all
         if best is None or cost < best[0] - 1e-9:
             best = (cost, k)
     k = best[1]
@@ -214,10 +327,19 @@ def choose_verify(cands: set, already_forked: bool) -> tuple[list[int], list[int
 
 
 # ------------------------------------------------------------------- analysis
+class Cands(dict):
+    """test number -> prior probability that it fails."""
+
+    def add(self, nums, p: float) -> None:
+        for n in nums:
+            if self.get(n, -1.0) < p:
+                self[n] = p
+
+
 class Plan:
     def __init__(self, cid: str):
         self.cid = cid
-        self.cands: set = set()
+        self.cands = Cands()
         self.need_snapshot = False
         self.all_tests = False  # include everything, unverified
         self.files: dict[str, str | None] = {}  # rel path -> new text (None = deleted)
@@ -254,7 +376,7 @@ def analyze(cid: str, text: str) -> Plan:
         rels = {r for r in (old_rel, new_rel) if r}
         if fp.is_binary:
             for r in rels:
-                plan.cands |= tests_reading(r)
+                plan.cands.add(tests_reading(r), P_DATA)
             continue
         try:
             old = read_pristine(old_rel) if old_rel and not fp.is_new else None
@@ -291,7 +413,7 @@ def analyze(cid: str, text: str) -> Plan:
         else:
             # data file
             for r in rels:
-                plan.cands |= tests_reading(r)
+                plan.cands.add(tests_reading(r), P_DATA)
                 if r.endswith(".py") and r.startswith("sqlglot/"):
                     plan.need_snapshot = True
     return plan
@@ -301,7 +423,7 @@ def tests_reading(rel: str) -> set:
     out: set = set()
     sid = READS.get(rel)
     if sid is not None:
-        out |= SETS[sid]
+        out.update(SETS[sid])
     for tf, paths in MODREADS.items():
         if rel in paths:
             out |= set(BY_FILE.get(tf, []))
@@ -310,39 +432,39 @@ def tests_reading(rel: str) -> set:
     d = os.path.dirname(rel)
     sid = DIRREADS.get(d)
     if sid is not None:
-        out |= SETS[sid]
+        out.update(SETS[sid])
     return out
 
 
 def sqlglot_change(plan: Plan, rel: str, ch: astdiff.PyChange) -> None:
-    plan.cands |= SPAWNERS
+    plan.cands.add(SPAWNERS, P_LOW)
     if ch.syntax_error:
         plan.need_snapshot = True  # the import error decides
         return
     if ch.runtime_lines:
-        plan.cands |= cov_tests(rel, ch.runtime_lines)
+        plan.cands.add(cov_tests(rel, ch.runtime_lines), P_CODE)
         # functions that also run while sqlglot is imported change import-time state
-        imp = IMPORT_LINES.get(rel, set())
+        imp = set(IMPORT_LINES.get(rel, ()))
         if any(l in imp for l in ch.runtime_lines if l > 0):
             plan.need_snapshot = True
     for q, first, last in ch.def_changes:
-        plan.cands |= func_span_tests(rel, first, last)
+        plan.cands.add(func_span_tests(rel, first, last), P_CODE)
     if ch.import_time:
         plan.need_snapshot = True
 
 
 def test_change(plan: Plan, rel: str, ch: astdiff.PyChange) -> None:
     if ch.syntax_error or ch.import_time:
-        plan.cands |= set(BY_FILE.get(rel, []))
+        plan.cands.add(BY_FILE.get(rel, []), P_TEST)
         for imp in TEST_IMPORTERS.get(rel, []):
-            plan.cands |= set(BY_FILE.get(imp, []))
+            plan.cands.add(BY_FILE.get(imp, []), P_TEST)
         if rel not in BY_FILE and not TEST_IMPORTERS.get(rel):
             # a helper module no test file is known to import: be safe
-            plan.cands |= tests_reading(rel)
+            plan.cands.add(tests_reading(rel), P_TEST)
     if ch.runtime_lines:
-        plan.cands |= cov_tests(rel, ch.runtime_lines)
+        plan.cands.add(cov_tests(rel, ch.runtime_lines), P_TEST)
         for q, first, last in ch.def_changes:
-            plan.cands |= func_span_tests(rel, first, last)
+            plan.cands.add(func_span_tests(rel, first, last), P_TEST)
 
 
 # ---------------------------------------------------- snapshot-diff candidates
@@ -380,12 +502,12 @@ def snapshot_candidates(pristine: dict, patched: dict, diff: dict, plan: Plan) -
             for x in sub:
                 sid = CLASSUSE.get(x)
                 if sid is not None:
-                    out |= SETS[sid]
+                    out.update(SETS[sid])
             continue
         hit = False
         for x in LK_BY_ATTR.get(attr, ()):
             if x in sub:
-                out |= SETS[LK[f"{x}|{attr}"]]
+                out.update(SETS[LK[f"{x}|{attr}"]])
                 hit = True
         # methods (unwrapped) and attributes no traced test ever read: fall back
         # to every test that used the class family, restricted to tests that ran
@@ -421,7 +543,7 @@ def method_lines(key: str, attr: str, pristine: dict, patched: dict):
     for x in [key]:
         sid = CLASSUSE.get(x)
         if sid is not None:
-            fam |= SETS[sid]
+            fam.update(SETS[sid])
     return out
 
 
@@ -429,10 +551,10 @@ def global_ref_tests(mod: str, name: str) -> set:
     out: set = set()
     if name == "*":
         rel = mod.replace(".", "/") + ".py"
-        for ln in COV.get(rel, {}):
-            out |= SETS[COV[rel][ln]]
+        for ln, sid_ in COV.get(rel, {}).items():
+            out.update(SETS[sid_])
         return out
-    for f, ln in NAMES.get(mod, {}).get(name, []):
+    for f, ln in NAMES.refs(mod, name):
         out |= cov_tests(f, [ln])
     rel = mod.replace(".", "/") + ".py"
     spans = M["defs"].get(rel, {}).get(name)
@@ -556,7 +678,7 @@ def child_main(plan: Plan, wfd: int) -> None:
         sys.path.insert(0, root)
         os.environ["SKIP_INTEGRATION"] = "0"
         sys.dont_write_bytecode = True
-        cands = set(plan.cands)
+        cands = Cands(plan.cands)
         everything = False
         if plan.need_snapshot:
             import fingerprint
@@ -565,7 +687,7 @@ def child_main(plan: Plan, wfd: int) -> None:
             patched = fingerprint.snapshot("sqlglot")
             d = fingerprint.diff(pristine, patched)
             extra, everything = snapshot_candidates(pristine, patched, d, plan)
-            cands |= extra
+            cands.add(extra, P_ATTR)
             result["diff"] = {"attrs": d["attrs"][:50], "globals": d["globals"][:50], "errors": d["errors"][:5], "n": len(extra)}
         if everything:
             result["select"] = sorted(ALL)
@@ -581,6 +703,11 @@ def child_main(plan: Plan, wfd: int) -> None:
         import traceback
 
         result["error"] = traceback.format_exc()[-1500:]
+    import resource as _r
+
+    _u = _r.getrusage(_r.RUSAGE_SELF)
+    _c = _r.getrusage(_r.RUSAGE_CHILDREN)
+    result["cpu"] = round(_u.ru_utime + _u.ru_stime + _c.ru_utime + _c.ru_stime, 3)
     data = (json.dumps(result) + "\n").encode()
     while data:
         k = os.write(wfd, data)
@@ -604,11 +731,13 @@ def main() -> None:
             p.all_tests = True
             p.notes.append(f"analyze error {e!r}")
             plans[cid] = p
+    _ru = __import__("resource").getrusage(0)
+    log(f"phase analyze cpu {_ru.ru_utime + _ru.ru_stime:.2f}")
     selections: dict[str, list[int]] = {}
     jobs = []
     for cid, p in plans.items():
         if UNKNOWN and (p.cands or p.need_snapshot):
-            p.cands |= set(UNKNOWN)
+            p.cands.add(UNKNOWN, P_LOW)
         if p.all_tests:
             selections[cid] = list(ALL)
         elif p.need_snapshot:
@@ -631,6 +760,8 @@ def main() -> None:
             import duckdb  # noqa: F401
         except Exception:  # noqa: BLE001
             pass
+    _ru = __import__("resource").getrusage(0)
+    log(f"phase preimport cpu {_ru.ru_utime + _ru.ru_stime:.2f}")
     # cheap first so a slow child cannot starve the rest
     jobs.sort(key=lambda c: (plans[c].need_snapshot, sum(SEC[x] for x in plans[c].cands)))
     running: dict[int, tuple[str, int, float]] = {}
