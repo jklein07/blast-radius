@@ -88,6 +88,17 @@ them across workers.
    classes, so they matter only for nodes of those classes, and a test can
    only get such a node through another changed lookup (the parser's
    `FUNCTIONS`, `FUNCTION_BY_NAME`, the new names), each charged on its own.
+   Tokenizer settings get a closer look too. A `Tokenizer` hands every
+   setting to a fresh `TokenizerCore` each time one is built, so the trace
+   shows every tokenizing test of a dialect family reading every setting.
+   Where a setting's value actually goes is read from the source: when its
+   only mentions are that hand-off (`field=self.SETTING`), class bodies,
+   class-creation hooks and code that runs only at test time, and the core
+   reads its field only as `self.field` after a single plain store in
+   `__init__`, the change is charged to the tests that ran the core's reads
+   of that field or those other lines, plus the test files that name the
+   setting. Both this set and the class-read set cover the change, so the
+   cheaper of the two is used.
 4. **Operator swaps → value profile.** When the only difference in a
    comparison is its operator (`is` for `==`, `<` for `<=`, `is not` for `!=`,
    ...), executing the line is not enough to change anything: the new

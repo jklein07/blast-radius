@@ -1226,6 +1226,7 @@ def snapshot_candidates(pristine: dict, patched: dict, diff: dict, plan: Plan) -
                 out.update(BY_FILE[tf])
 
     live = None
+    flows: list = []
     for key, attr in diff["attrs"]:
         if attr == "__doc__":
             continue  # docstrings: nothing reads them at runtime
@@ -1251,24 +1252,20 @@ def snapshot_candidates(pristine: dict, patched: dict, diff: dict, plan: Plan) -
                 if sid is not None:
                     out.update(SETS[sid])
             continue
-        hit = False
-        for x in LK_BY_ATTR.get(attr, ()):
-            if x in sub:
-                out.update(SETS[LK[f"{x}|{attr}"]])
-                hit = True
-        # methods (unwrapped) and attributes no traced test ever read: fall back
-        # to every test that used the class family, restricted to tests that ran
-        # code of a same-named function anywhere in that family's sources.
-        meth = method_lines(key, attr, pristine, patched)
-        if meth is not None:
-            out |= meth
-        elif not hit and (attr.startswith("_") or attr not in LK_BY_ATTR):
-            # (private attributes are mostly derived caches a metaclass or a
-            # lazily built object reads before any test runs, so the trace may
-            # not have seen their readers)
-            # reads the descriptors cannot record (dunders such as __slots__,
-            # enum members, descriptors): every user of the class family
-            out |= family_tests(key, sub)
+        base = attr_reader_tests(key, attr, sub, pristine, patched)
+        if live is None:
+            import fingerprint
+
+            live = dict(fingerprint.iter_classes(sorted(sys.modules), "sqlglot"))
+        t = core_flow_tests(key, attr, plan, live)
+        if t is not None:
+            # a tokenizer setting: the tests that ran the core's reads of it,
+            # or those that read it through the class (both cover it)
+            flows.append((t, base))
+            continue
+        out |= base
+    if flows:
+        out |= cheapest_cover(out, flows)
     for mod, name in diff["globals"]:
         if name == "__doc__":
             continue
@@ -1403,6 +1400,362 @@ def expr_registry_grew(pristine: dict, diff: dict, plan: Plan) -> bool:
     except Exception:  # noqa: BLE001
         return False
     return True
+
+
+# ------------------------------------------------- tokenizer settings flow
+# Tokenizer._init_core hands every tokenizer setting to a new TokenizerCore
+# each time a tokenizer is built, so every test that tokenizes reads every
+# setting through the class, and the attribute-read trace cannot tell which
+# tests use which. What a setting does is decided where the core reads the
+# field it was handed (`self.byte_string_escapes` in a byte-string branch,
+# say). A setting whose only by-name reads are that hand-off, class bodies
+# and class-creation hooks (whose results land on classes, which the
+# snapshot compares) is charged to the tests that ran the core's reads of
+# its field, the hook lines they ran, and the test files that name it.
+_TOK_REL = "sqlglot/tokens.py"
+_CORE_REL = "sqlglot/tokenizer_core.py"
+_MENTIONS: dict = {}
+_FLOW: dict = {}
+
+
+def _mentions_cached(word: str) -> list:
+    if word not in _MENTIONS:
+        _MENTIONS[word] = _mention_sites(word)
+    return _MENTIONS[word]
+
+
+def _flow_kinds(src: str, word: str, lines) -> dict | None:
+    """line -> kind for each given line of src that mentions word:
+    ("transfer", field) for the keyword argument field=self.word (or
+    bool(self.word)) of the TokenizerCore(...) call in Tokenizer._init_core,
+    "hook" in a class-creation hook (__init_subclass__, a metaclass's
+    __new__/__init__), "class" in a class body, "comment". None when any
+    line is anything else (code that runs at test time, module level, a def
+    header, a class created inside a function)."""
+    import ast
+
+    try:
+        tree = ast.parse(src)
+    except SyntaxError:
+        return None
+    text = src.split("\n")
+    spans: list = []
+
+    def walk(body, chain):
+        for st in body:
+            spans.append((st.lineno, st.end_lineno or st.lineno, st, chain))
+            if isinstance(st, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                walk(st.body, chain + (st,))
+                continue
+            for f in ("body", "orelse", "finalbody"):
+                walk(getattr(st, f, None) or [], chain)
+            for h in getattr(st, "handlers", None) or []:
+                walk(h.body, chain)
+            for c in getattr(st, "cases", None) or []:
+                walk(c.body, chain)
+
+    walk(tree.body, ())
+    FN = (ast.FunctionDef, ast.AsyncFunctionDef)
+    out: dict = {}
+    for ln in lines:
+        if 0 < ln <= len(text) and text[ln - 1].strip().startswith("#"):
+            out[ln] = "comment"
+            continue
+        inner = None
+        for first, last, st, chain in spans:
+            if first <= ln <= last and (inner is None or (first >= inner[0] and last <= inner[1])):
+                inner = (first, last, st, chain)
+        if inner is None:
+            return None
+        _f, _l, st, chain = inner
+        if isinstance(st, (*FN, ast.ClassDef)):
+            return None  # a header: decorators, defaults, bases
+        if not chain:
+            return None  # module level
+        # the statement's own lines (a compound statement: its header)
+        hdr = st.end_lineno or st.lineno
+        if isinstance(st, (ast.If, ast.While)):
+            hdr = st.test.end_lineno or st.lineno
+        elif isinstance(st, (ast.For, ast.AsyncFor)):
+            hdr = max(st.iter.end_lineno or st.lineno, st.target.end_lineno or st.lineno)
+        elif isinstance(st, (ast.With, ast.AsyncWith)):
+            hdr = max((it.context_expr.end_lineno or st.lineno) for it in st.items)
+        elif isinstance(st, ast.Match):
+            hdr = st.subject.end_lineno or st.lineno
+        elif isinstance(st, (ast.Try, getattr(ast, "TryStar", ast.Try))):
+            hdr = st.lineno
+        read = ("read", st.lineno, hdr)
+        if isinstance(chain[-1], ast.ClassDef):
+            if any(isinstance(c, FN) for c in chain):
+                out[ln] = read  # a class body run when its function runs
+                continue
+            out[ln] = "class"
+            continue
+        fn = chain[-1]
+        owner = chain[-2] if len(chain) >= 2 else None
+        if not isinstance(owner, ast.ClassDef) or any(isinstance(c, FN) for c in chain[:-1]):
+            out[ln] = read  # code that runs when its function is called
+            continue
+        if fn.name == "__init_subclass__" or (
+            fn.name in ("__new__", "__init__") and any(isinstance(b, ast.Name) and b.id == "type" for b in owner.bases)
+        ):
+            out[ln] = "hook"
+            continue
+        if fn.name == "_init_core" and owner.name == "Tokenizer" and len(chain) == 2:
+            field = None
+            for node in ast.walk(fn):
+                if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "TokenizerCore":
+                    for kw in node.keywords:
+                        v = kw.value
+                        if isinstance(v, ast.Call) and isinstance(v.func, ast.Name) and v.func.id == "bool" and len(v.args) == 1 and not v.keywords:
+                            v = v.args[0]
+                        if (
+                            kw.arg
+                            and isinstance(v, ast.Attribute)
+                            and isinstance(v.value, ast.Name)
+                            and v.value.id == "self"
+                            and v.attr == word
+                            and kw.value.lineno <= ln <= (kw.value.end_lineno or kw.value.lineno)
+                        ):
+                            field = kw.arg
+            if field:
+                out[ln] = ("transfer", field)
+                continue
+        out[ln] = read  # a method that runs at test time
+    return out
+
+
+def _core_field_uses(src: str, field: str) -> set | None:
+    """Lines of TokenizerCore that load self.<field>; None when the field is
+    written any other way than one plain store `self.field = field` in
+    __init__, read off anything but self, or named as a string outside
+    __slots__. (Locals, parameters and keyword arguments that share its name
+    hold only what such a load gave them.)"""
+    import ast
+
+    try:
+        tree = ast.parse(src)
+    except SyntaxError:
+        return None
+    cores = [c for c in tree.body if isinstance(c, ast.ClassDef) and c.name == "TokenizerCore"]
+    if len(cores) != 1:
+        return None
+    core = cores[0]
+    uses: set = set()
+    stores = 0
+
+    def visit(node, where):
+        nonlocal stores
+        if isinstance(node, ast.Attribute) and node.attr == field:
+            if not (where in ("method", "init", "nested") and isinstance(node.value, ast.Name) and node.value.id == "self"):
+                return False
+            if isinstance(node.ctx, ast.Load):
+                uses.update(range(node.lineno, (node.end_lineno or node.lineno) + 1))
+            elif not (isinstance(node.ctx, ast.Store) and where == "init"):
+                return False
+        elif isinstance(node, ast.Constant) and node.value == field:
+            if where != "slots":
+                return False
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and node.name == field:
+            return False
+        elif isinstance(node, ast.alias) and field in (node.name, node.asname):
+            return False
+        elif isinstance(node, (ast.Global, ast.Nonlocal)) and field in node.names:
+            return False
+        if isinstance(node, (ast.AugAssign, ast.AnnAssign)) and isinstance(node.target, ast.Attribute) and node.target.attr == field:
+            return False
+        if isinstance(node, ast.Assign) and where == "init":
+            t = node.targets
+            if any(isinstance(x, ast.Attribute) and x.attr == field for x in t):
+                if not (
+                    len(t) == 1
+                    and isinstance(t[0], ast.Attribute)
+                    and isinstance(t[0].value, ast.Name)
+                    and t[0].value.id == "self"
+                    and isinstance(node.value, ast.Name)
+                    and node.value.id == field
+                ):
+                    return False
+                stores += 1
+        for ch in ast.iter_child_nodes(node):
+            w = where
+            if node is core:
+                if isinstance(ch, ast.Assign) and any(isinstance(x, ast.Name) and x.id == "__slots__" for x in ch.targets):
+                    w = "slots"
+                elif isinstance(ch, ast.FunctionDef):
+                    w = "init" if ch.name == "__init__" else "method"
+                else:
+                    w = "core"
+            elif isinstance(ch, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.ClassDef)) and where in ("init", "method"):
+                w = "nested"  # a closure or nested class could keep the value
+            if visit(ch, w) is False:
+                return False
+        return True
+
+    if visit(tree, "module") is False or stores != 1:
+        return None
+    return uses
+
+
+def _reads_member(src, word: str) -> bool:
+    """Whether src may read a member called word: an attribute access
+    `.word`, or the string "word" (getattr, __slots__ walks). True when it
+    cannot be parsed."""
+    import ast
+
+    if src is None:
+        return True
+    try:
+        tree = ast.parse(src)
+    except SyntaxError:
+        return True
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Attribute) and node.attr == word:
+            return True
+        if isinstance(node, ast.Constant) and node.value == word:
+            return True
+    return False
+
+
+def core_flow_tests(key: str, attr: str, plan: Plan, live: dict) -> set | None:
+    """Tests a change to the tokenizer setting key.attr can reach, by where
+    its value flows (see above); None when the rule does not apply."""
+    try:
+        tok = sys.modules.get("sqlglot.tokens")
+        c = live.get(key)
+        if tok is None or c is None or not (isinstance(c, type) and issubclass(c, tok.Tokenizer)):
+            return None
+        if attr.startswith("__") or _CORE_REL in plan.files:
+            return None
+        ck = (plan.cid, attr)
+        if ck in _FLOW:
+            return _FLOW[ck]
+        _FLOW[ck] = None
+        out: set = set()
+        fields: set = set()
+        hook_lines: dict = {}
+        sites = _mentions_cached(attr)
+        by_rel: dict = {}
+        for rel, ln, _t in sites:
+            if rel is None:
+                return None
+            by_rel.setdefault(rel, []).append(ln)
+        for rel, lines in by_rel.items():
+            if rel.startswith("tests/"):
+                out.update(BY_FILE.get(rel, ()))
+                for imp in TEST_IMPORTERS.get(rel, []):
+                    out.update(BY_FILE.get(imp, ()))
+                continue
+            if not (rel.startswith("sqlglot/") and rel.endswith(".py")):
+                return None
+            src = read_pristine(rel)
+            kinds = _flow_kinds(src, attr, lines) if src is not None else None
+            if kinds is None:
+                return None
+            imp_rel = set(IMPORT_LINES.get(rel, ()))
+            for ln, k in kinds.items():
+                if isinstance(k, tuple) and k[0] == "transfer":
+                    if rel != _TOK_REL:
+                        return None
+                    fields.add(k[1])
+                elif isinstance(k, tuple):  # ("read", first, last): runs at test time
+                    span = range(k[1], k[2] + 1)
+                    if any(x in imp_rel for x in span):
+                        return None  # also while sqlglot imports: what it built may persist
+                    hook_lines.setdefault(rel, []).extend(span)
+                elif k == "hook":
+                    hook_lines.setdefault(rel, []).append(ln)
+        import re
+
+        def lines_of(text, word):
+            pat = re.compile(r"(?<![A-Za-z0-9_])" + re.escape(word) + r"(?![A-Za-z0-9_])")
+            return [i for i, s in enumerate(text.split("\n"), 1) if pat.search(s)]
+
+        # the patched files may not add other kinds of reads either
+        for rel, text in plan.files.items():
+            if text is None or not rel.endswith(".py") or rel.startswith("tests/"):
+                continue
+            ls = lines_of(text, attr)
+            if not ls:
+                continue
+            if not rel.startswith("sqlglot/"):
+                return None
+            kinds = _flow_kinds(text, attr, ls)
+            if kinds is None:
+                return None
+            for k in kinds.values():
+                if isinstance(k, tuple) and k[0] == "transfer":
+                    if rel != _TOK_REL:
+                        return None
+                    fields.add(k[1])
+        core_src = read_pristine(_CORE_REL)
+        if core_src is None:
+            return None
+        imp = set(IMPORT_LINES.get(_CORE_REL, ()))
+        for field in fields:
+            uses = _core_field_uses(core_src, field)
+            if uses is None or uses & imp:
+                return None  # read some other way, or while sqlglot imports
+            # nothing else may read the field off a core: no `.field` access
+            # and no "field" string anywhere else, old or patched
+            for rel in {r for r, _l, _t in _mentions_cached(field)}:
+                if rel is None:
+                    return None
+                if rel == _CORE_REL or not rel.endswith(".py"):
+                    continue
+                if _reads_member(read_pristine(rel), field):
+                    return None
+            for rel, text in plan.files.items():
+                if text is not None and rel.endswith(".py") and lines_of(text, field) and _reads_member(text, field):
+                    return None
+            out |= cov_tests(_CORE_REL, sorted(uses))
+        for rel, ls in hook_lines.items():
+            out |= cov_tests(rel, ls)
+        _FLOW[ck] = out
+        return out
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def cheapest_cover(have: set, pairs: list) -> set:
+    """One set from each (a, b) pair, chosen so that the union with have
+    costs the fewest recorded test seconds."""
+    import itertools
+
+    def cost(sel):
+        u = set().union(*sel) - have
+        return sum(SEC.get(n, 0) for n in u)
+
+    if len(pairs) > 8:
+        opts = [[a for a, _ in pairs], [b for _, b in pairs]]
+    else:
+        opts = (list(c) for c in itertools.product(*pairs))
+    best = min(opts, key=cost)
+    return set().union(*best)
+
+
+def attr_reader_tests(key: str, attr: str, sub, pristine: dict, patched: dict) -> set:
+    """Tests that read class attribute key.attr through the class family sub."""
+    out: set = set()
+    hit = False
+    for x in LK_BY_ATTR.get(attr, ()):
+        if x in sub:
+            out.update(SETS[LK[f"{x}|{attr}"]])
+            hit = True
+    # methods (unwrapped) and attributes no traced test ever read: fall back
+    # to every test that used the class family, restricted to tests that ran
+    # code of a same-named function anywhere in that family's sources.
+    meth = method_lines(key, attr, pristine, patched)
+    if meth is not None:
+        out |= meth
+    elif not hit and (attr.startswith("_") or attr not in LK_BY_ATTR):
+        # (private attributes are mostly derived caches a metaclass or a
+        # lazily built object reads before any test runs, so the trace may
+        # not have seen their readers)
+        # reads the descriptors cannot record (dunders such as __slots__,
+        # enum members, descriptors): every user of the class family
+        out |= family_tests(key, sub)
+    return out
 
 
 def fresh_member(key: str, attr: str, plan: Plan, pristine: dict) -> bool:
