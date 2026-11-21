@@ -180,7 +180,11 @@ them across workers.
    margin; 15 s for class setup); a test that runs out of time is kept,
    because a patch that makes a test hang makes it fail. A test stops at
    its first failing subtest: it has failed, and the rest would only cost
-   time. A patch can also
+   time. The tests that hand fixture pairs or TPC queries to a process pool
+   run in the child with an in-process pool whose tasks run, in the order
+   they were submitted, when their result is first asked for; so a test
+   that fails at one pair never computes the pairs after it, and a test
+   that passes runs every task as before. A patch can also
    make a test allocate without end, faster than any timer: a thread in each
    child stops it once it holds 1.3 GB more than at the fork (address space
    is capped too, far above that), and that commit keeps every candidate, so
@@ -242,11 +246,11 @@ references).
 
 | File | Role |
 | --- | --- |
-| `selector.py` | Runtime entry point |
+| `selector.py` | Runtime entry point (`run.py` runs it from its compiled bytecode) |
 | `astdiff.py` | Semantic AST diff |
 | `fingerprint.py` | Import-time state fingerprints and diff |
 | `patchapply.py` | Unified-diff parser and applier (stdlib only) |
-| `inline.py` | In-process ProcessPoolExecutor with pickle round trips |
+| `inline.py` | In-process ProcessPoolExecutor with pickle round trips, tasks run when their result is asked for |
 | `xsetup.py`, `mkxcache.py` | `TestExecutor`'s class setup from rows stored at image build (`xcache.bin`) |
 | `tracer.py`, `modlines.py`, `build_maps.py`, `mksnap.py` | Build-time tools that produce `maps/maps.json.gz` and `snap.json` from the pinned commit |
 | `wmtrace.py`, `build_wm.py` | Build-time: comparison-swap profile, `maps/wm.json.gz` |

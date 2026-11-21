@@ -118,6 +118,19 @@ _IDENTITY = all(_local2num[i] == i for i in range(len(_local2num)))
 import array as _array
 
 
+def _side_map(name: str):
+    """A map beside maps.json.gz: its marshal copy (prep.py) when the image
+    has one, else the gzipped JSON. Same content either way."""
+    base = os.path.join(os.path.dirname(MAPS), name)
+    if os.path.exists(base + ".bin"):
+        import marshal
+
+        with open(base + ".bin", "rb") as fh:
+            return marshal.loads(fh.read())
+    with gzip.open(base + ".json.gz", "rt") as fh:
+        return json.load(fh)
+
+
 def _u16(b):
     if isinstance(b, (bytes, bytearray)):
         a = _array.array("H")
@@ -348,8 +361,7 @@ def reg_tests(rel: str, ch) -> set:
     global _REG
     if _REG is None:
         try:
-            with gzip.open(os.path.join(os.path.dirname(MAPS), "regcov.json.gz"), "rt") as fh:
-                _REG = json.load(fh)
+            _REG = _side_map("regcov")
         except OSError:
             _REG = {}
     fm = _REG.get(rel)
@@ -369,8 +381,7 @@ def split_maps() -> dict:
     global _SPLIT
     if _SPLIT is None:
         try:
-            with gzip.open(os.path.join(os.path.dirname(MAPS), "split.json.gz"), "rt") as fh:
-                _SPLIT = json.load(fh)
+            _SPLIT = _side_map("split")
         except Exception:  # noqa: BLE001
             _SPLIT = {}
     return _SPLIT
@@ -383,8 +394,7 @@ def fe_maps() -> dict:
     global _FE
     if _FE is None:
         try:
-            with gzip.open(os.path.join(os.path.dirname(MAPS), "fe.json.gz"), "rt") as fh:
-                _FE = json.load(fh)
+            _FE = _side_map("fe")
             for v in _FE.values():
                 v["_exec"] = {f: set(ls) for f, ls in v["exec"].items()}
         except Exception:  # noqa: BLE001
@@ -501,8 +511,7 @@ def cf_maps() -> dict:
     global _CF
     if _CF is None:
         try:
-            with gzip.open(os.path.join(os.path.dirname(MAPS), "cf.json.gz"), "rt") as fh:
-                _CF = json.load(fh)
+            _CF = _side_map("cf")
         except Exception:  # noqa: BLE001
             _CF = {}
     return _CF
@@ -1034,8 +1043,7 @@ def wm_maps() -> dict:
     global _WM
     if _WM is None:
         try:
-            with gzip.open(os.path.join(os.path.dirname(MAPS), "wm.json.gz"), "rt") as fh:
-                _WM = json.load(fh)
+            _WM = _side_map("wm")
             nums = [NUM_BY_ID.get(i) for i in _WM["tests"]]
             _WM["_nums"] = nums
             _WM["_incomplete"] = {nums[i] for i in _WM["incomplete"] if nums[i] is not None}
@@ -1063,8 +1071,7 @@ def bw_maps() -> dict:
     global _BW
     if _BW is None:
         try:
-            with gzip.open(os.path.join(os.path.dirname(MAPS), "bw.json.gz"), "rt") as fh:
-                _BW = json.load(fh)
+            _BW = _side_map("bw")
             nums = [NUM_BY_ID.get(i) for i in _BW["tests"]]
             _BW["_nums"] = nums
             _BW["_incomplete"] = {nums[i] for i in _BW["incomplete"] if nums[i] is not None}
@@ -2432,6 +2439,9 @@ def run_tests(nums: list[int], split: dict | None = None) -> tuple[set, set]:
     _ph("load")
     import inline
 
+    # a failing test stops at its first failing pair: the pool tasks of the
+    # pairs after it never run (inline.py)
+    inline.LAZY = os.environ.get("BR_LAZYPOOL", "1") == "1"
     inline.install()
     if XFAST and FARM[0] and "tests.test_executor" in sys.modules:
         # TestExecutor's set-up from the stored rows, when every file they

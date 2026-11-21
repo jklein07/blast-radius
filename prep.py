@@ -28,3 +28,14 @@ m["name_files"] = files
 m["names"] = {mod: {n: i32([v for f, ln in refs for v in (fidx[f], ln)]) for n, refs in d.items()} for mod, d in m["names"].items()}
 with open(dst, "wb") as fh:
     marshal.dump(m, fh)
+
+# the smaller maps beside it, as marshal too (same content: JSON types only)
+import os
+
+for name in ("regcov", "split", "fe", "cf", "wm", "bw"):
+    side = os.path.join(os.path.dirname(src), name + ".json.gz")
+    if os.path.exists(side):
+        with gzip.open(side, "rt") as fh:
+            obj = json.load(fh)
+        with open(os.path.join(os.path.dirname(dst), name + ".bin"), "wb") as fh:
+            marshal.dump(obj, fh)
