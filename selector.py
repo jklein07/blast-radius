@@ -1298,6 +1298,8 @@ def snapshot_candidates(pristine: dict, patched: dict, diff: dict, plan: Plan) -
         for tf in sorted(BY_FILE):
             try:
                 importlib.import_module(tf[:-3].replace("/", "."))
+            except _Timeout:
+                raise
             except BaseException:  # noqa: BLE001
                 out.update(BY_FILE[tf])
 
@@ -2264,6 +2266,28 @@ def _on_alarm(*_):
     raise _Timeout()
 
 
+# CPU seconds a child may spend importing the patched code (sqlglot for the
+# snapshot, test modules before verification). Normal imports take a fraction
+# of a second; a patch that loops forever where modules run code at import
+# (a parser loop reached from a module-level parse) would otherwise hold the
+# child until the parent kills it. That patch makes pytest's collection hang
+# too, so the answer is every test.
+PREP_CPU = float(os.environ.get("BR_PREP_CPU", "8"))
+HUNG = [False]
+
+
+def _on_prof(*_):
+    HUNG[0] = True
+    raise _Timeout()
+
+
+def _prep_limit(sec: float) -> None:
+    """CPU-time limit (ITIMER_PROF, apart from the tests' wall-clock alarms); 0 cancels."""
+    if sec > 0:
+        signal.signal(signal.SIGPROF, _on_prof)
+    signal.setitimer(signal.ITIMER_PROF, sec)
+
+
 def _apply_split(split: dict, tpc: bool = True) -> None:
     """Cut the query lists setUpClass loads down to the queries to verify,
     and the optimizer tests' fixture loads down to the pairs to verify."""
@@ -2355,14 +2379,20 @@ def run_tests(nums: list[int], split: dict | None = None) -> tuple[set, set]:
 
     signal.signal(signal.SIGALRM, _on_alarm)
     suites = []
+    _prep_limit(PREP_CPU)
     for (mod, cls), items in by_class.items():
         suite = unittest.TestSuite()
         for n, uid in items:
             try:
                 suite.addTest(loader.loadTestsFromName(uid))
+            except _Timeout:
+                raise
             except BaseException:  # noqa: BLE001
                 failing.add(n)
         suites.append((items, suite))
+    _prep_limit(0)
+    if HUNG[0]:
+        raise _Timeout()
     _ph("load")
     import inline
 
@@ -2618,6 +2648,7 @@ def child_main(plan: Plan, wfd: int) -> None:
         if DEBUG:
             result["pre"] = pre
         _ph("farm")
+        _prep_limit(PREP_CPU)
         os.chdir(root)
         sys.path.insert(0, root)
         os.environ["SKIP_INTEGRATION"] = "0"
@@ -2633,6 +2664,8 @@ def child_main(plan: Plan, wfd: int) -> None:
                 import sqlglot as _sg
 
                 lazy = len(_sg.Dialect._classes) == 1
+            except _Timeout:
+                raise
             except BaseException:  # noqa: BLE001
                 lazy = False
         if plan.need_snapshot:
@@ -2648,6 +2681,9 @@ def child_main(plan: Plan, wfd: int) -> None:
             cands.add(extra, P_ATTR)
             _ph("snap")
             result["diff"] = {"attrs": d["attrs"][:50], "globals": d["globals"][:50], "errors": d["errors"][:5], "n": len(extra)}
+        _prep_limit(0)
+        if HUNG[0]:
+            raise _Timeout()  # (in case a handler above swallowed it)
         gc.enable()
         if everything:
             result["select"] = sorted(ALL)
@@ -2700,7 +2736,13 @@ def child_main(plan: Plan, wfd: int) -> None:
     except BaseException as e:  # noqa: BLE001
         import traceback
 
-        result["error"] = traceback.format_exc()[-1500:]
+        _prep_limit(0)
+        if HUNG[0]:
+            result["select"] = sorted(ALL)
+            result["verified"] = 0
+            result["hung"] = True
+        else:
+            result["error"] = traceback.format_exc()[-1500:]
     import resource as _r
 
     _u = _r.getrusage(_r.RUSAGE_SELF)
