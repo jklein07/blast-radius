@@ -948,6 +948,13 @@ def snapshot_candidates(pristine: dict, patched: dict, diff: dict, plan: Plan) -
             sid = DIRREADS.get(os.path.dirname(_mod_rel(m)))
             if sid is not None:
                 out.update(SETS[sid])
+            # every test that read anything through one of its classes
+            for key in pristine["classes"]:
+                if key.partition(":")[0] == m:
+                    for x in subtree(key):
+                        sid = CLASSUSE.get(x)
+                        if sid is not None:
+                            out.update(SETS[sid])
         # and measured, not inferred: import every test module from the patched
         # tree, as pytest's collection does before any test runs. A test file
         # that no longer imports fails whole, whatever chain broke it.
@@ -958,13 +965,6 @@ def snapshot_candidates(pristine: dict, patched: dict, diff: dict, plan: Plan) -
                 importlib.import_module(tf[:-3].replace("/", "."))
             except BaseException:  # noqa: BLE001
                 out.update(BY_FILE[tf])
-                plan.notes.append(f"collect fails {tf}")
-            for key in pristine["classes"]:
-                if key.partition(":")[0] == m:
-                    for x in subtree(key):
-                        sid = CLASSUSE.get(x)
-                        if sid is not None:
-                            out.update(SETS[sid])
 
     live = None
     for key, attr in diff["attrs"]:
