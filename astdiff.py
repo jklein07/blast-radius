@@ -73,11 +73,29 @@ def _span(x):
 
 
 class _Walker:
-    def __init__(self, change: PyChange, old_lines=None, new_lines=None):
+    def __init__(self, change: PyChange, old_lines=None, new_lines=None, old_src=None, new_src=None):
         self.c = change
         self.ol = old_lines
         self.nl = new_lines
         self._swap = None
+        self._src = (old_src, new_src)
+        self._code: list = [None, None]
+
+    def _same_code(self, fa, fb) -> bool:
+        """The compiled functions match instruction for instruction, with the
+        same constants, global and attribute names and parameters: only the
+        names of locals may differ."""
+        for i in (0, 1):
+            if self._code[i] is None:
+                try:
+                    self._code[i] = compile(self._src[i], "<m>", "exec", dont_inherit=True)
+                except Exception:  # noqa: BLE001
+                    self._code[i] = False
+        if not self._code[0] or not self._code[1]:
+            return False
+        ca = _find_code(self._code[0], fa)
+        cb = _find_code(self._code[1], fb)
+        return ca is not None and cb is not None and _code_equal(ca, cb)
 
     def _key(self, x, lines):
         """Source text of an element (whole lines). Equal text means an equal
@@ -112,6 +130,8 @@ class _Walker:
                 hdr_a = [getattr(a, f, None) for f in ("args", "decorator_list", "returns", "name", "type_params")]
                 hdr_b = [getattr(b, f, None) for f in ("args", "decorator_list", "returns", "name", "type_params")]
                 hdr_same = all(_dump_any(x) == _dump_any(y) for x, y in zip(hdr_a, hdr_b))
+                if hdr_same and _alpha_equal(a, b) and self._same_code(a, b):
+                    return  # the same code with its local variables renamed
                 if not hdr_same:
                     self.report_def(a, ctx)
                 body_a = a.body if isinstance(a.body, list) else [a.body]
@@ -275,6 +295,263 @@ class _Walker:
                     self.c.toplevel_names.add((al.asname or al.name).split(".")[0])
 
 
+# ------------------------------------------------------------ renamed locals
+# A function whose new body is the old one with some of its local variables
+# consistently renamed behaves the same: Python resolves a name by where it is
+# bound, and every binding and use of a renamed name moves with it. Only plain
+# variable names may differ (never parameters, attributes, keywords, imports,
+# except/match captures or def names), each renamed name must resolve to a
+# binding inside the function at every use (never a global or builtin), on
+# both sides, and the function must not reach its own frame or namespace.
+_FRAME_NAMES = {"locals", "vars", "eval", "exec", "dir", "globals", "compile", "breakpoint", "__import__"}
+_FRAME_ATTRS = {"_getframe", "currentframe", "f_locals", "f_back", "f_globals", "f_code", "stack", "trace",
+                "getouterframes", "getinnerframes", "getframeinfo", "co_varnames", "co_names", "__code__"}
+_COMPS = (ast.ListComp, ast.SetComp, ast.GeneratorExp, ast.DictComp)
+
+
+class _Unsupported(Exception):
+    pass
+
+
+def _shape(x, y, m: dict, rev: dict) -> bool:
+    """Equal trees except for ast.Name ids, which must correspond one to one."""
+    if type(x) is not type(y):
+        return False
+    if isinstance(x, ast.AST):
+        for f in x._fields:
+            vx, vy = getattr(x, f, None), getattr(y, f, None)
+            if f == "id" and isinstance(x, ast.Name):
+                if m.setdefault(vx, vy) != vy or rev.setdefault(vy, vx) != vx:
+                    return False
+            elif not _shape(vx, vy, m, rev):
+                return False
+        return True
+    if isinstance(x, list):
+        return len(x) == len(y) and all(_shape(p, q, m, rev) for p, q in zip(x, y))
+    return x == y
+
+
+class _Scope:
+    __slots__ = ("parent", "comp", "bound", "params", "uses")
+
+    def __init__(self, parent, comp=False):
+        self.parent = parent
+        self.comp = comp
+        self.bound: set = set()
+        self.params: set = set()
+        self.uses: list = []
+
+
+def _params(a: ast.arguments) -> set:
+    out = {x.arg for x in a.posonlyargs + a.args + a.kwonlyargs}
+    for x in (a.vararg, a.kwarg):
+        if x is not None:
+            out.add(x.arg)
+    return out
+
+
+def _scopes(fn) -> list:
+    """The scopes inside fn (fn's own first), with the names each binds and uses."""
+    root = _Scope(None)
+    root.params = _params(fn.args)
+    root.bound |= root.params
+    out = [root]
+
+    def new(parent, comp=False):
+        sc = _Scope(parent, comp)
+        out.append(sc)
+        return sc
+
+    def visit(n, sc):
+        if isinstance(n, (ast.ClassDef, ast.Global, ast.Nonlocal)):
+            raise _Unsupported
+        if isinstance(n, ast.Name):
+            if n.id in _FRAME_NAMES:
+                raise _Unsupported
+            if not isinstance(n.ctx, ast.Load):
+                sc.bound.add(n.id)
+            sc.uses.append(n.id)
+            return
+        if isinstance(n, ast.Attribute) and n.attr in _FRAME_ATTRS:
+            raise _Unsupported
+        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+            if not isinstance(n, ast.Lambda):
+                sc.bound.add(n.name)
+                sc.uses.append(n.name)
+                for d in n.decorator_list:
+                    visit(d, sc)
+                if n.returns is not None:
+                    visit(n.returns, sc)
+            a = n.args
+            for d in a.defaults + [d for d in a.kw_defaults if d is not None]:
+                visit(d, sc)
+            for x in a.posonlyargs + a.args + a.kwonlyargs + [y for y in (a.vararg, a.kwarg) if y is not None]:
+                if x.annotation is not None:
+                    visit(x.annotation, sc)
+            child = new(sc)
+            child.params = _params(a)
+            child.bound |= child.params
+            for x in n.body if isinstance(n.body, list) else [n.body]:
+                visit(x, child)
+            return
+        if isinstance(n, _COMPS):
+            gens = n.generators
+            visit(gens[0].iter, sc)  # the first iterable runs in the enclosing scope
+            child = new(sc, comp=True)
+            for i, g in enumerate(gens):
+                if i:
+                    visit(g.iter, child)
+                visit(g.target, child)
+                for c in g.ifs:
+                    visit(c, child)
+            for x in ((n.key, n.value) if isinstance(n, ast.DictComp) else (n.elt,)):
+                visit(x, child)
+            return
+        if isinstance(n, ast.NamedExpr):
+            t = sc
+            while t.comp:  # binds in the nearest enclosing function scope
+                t = t.parent
+            t.bound.add(n.target.id)
+            t.uses.append(n.target.id)
+            visit(n.value, sc)
+            return
+        if isinstance(n, ast.ExceptHandler) and n.name:
+            sc.bound.add(n.name)
+            sc.uses.append(n.name)
+        elif isinstance(n, (ast.Import, ast.ImportFrom)):
+            for al in n.names:
+                nm = al.asname or al.name.split(".")[0]
+                sc.bound.add(nm)
+                sc.uses.append(nm)
+        elif isinstance(n, (ast.MatchAs, ast.MatchStar)) and n.name:
+            sc.bound.add(n.name)
+            sc.uses.append(n.name)
+        elif isinstance(n, ast.MatchMapping) and n.rest:
+            sc.bound.add(n.rest)
+            sc.uses.append(n.rest)
+        for c in ast.iter_child_nodes(n):
+            visit(c, sc)
+
+    for x in fn.body if isinstance(fn.body, list) else [fn.body]:
+        visit(x, root)
+    return out
+
+
+def _all_local(fn, names: set) -> bool:
+    """Every use of each name resolves to a non-parameter binding inside fn."""
+    try:
+        scopes = _scopes(fn)
+    except _Unsupported:
+        return False
+    for sc in scopes:
+        for nm in sc.uses:
+            if nm not in names:
+                continue
+            t = sc
+            while t is not None and nm not in t.bound:
+                t = t.parent
+            if t is None or nm in t.params:
+                return False
+    return True
+
+
+def _alpha_equal(fa, fb) -> bool:
+    m: dict = {}
+    rev: dict = {}
+    try:
+        if not _shape(fa, fb, m, rev):
+            return False
+    except RecursionError:
+        return False
+    old = {x for x, y in m.items() if x != y}
+    if not old:
+        return False
+    return _all_local(fa, old) and _all_local(fb, {m[x] for x in old})
+
+
+def _find_code(module_code, fn):
+    """The code object compiled for def/lambda node fn, or None (or None if ambiguous)."""
+    name = "<lambda>" if isinstance(fn, ast.Lambda) else fn.name
+    first = fn.lineno if isinstance(fn, ast.Lambda) else _first(fn)
+    found = []
+    stack = [module_code]
+    while stack:
+        co = stack.pop()
+        for k in co.co_consts:
+            if isinstance(k, type(module_code)):
+                if k.co_name == name and k.co_firstlineno == first:
+                    found.append(k)
+                stack.append(k)
+    return found[0] if len(found) == 1 else None
+
+
+def _code_equal(ca, cb) -> bool:
+    if (ca.co_code != cb.co_code or ca.co_names != cb.co_names or ca.co_flags != cb.co_flags
+            or ca.co_argcount != cb.co_argcount or ca.co_posonlyargcount != cb.co_posonlyargcount
+            or ca.co_kwonlyargcount != cb.co_kwonlyargcount or ca.co_nlocals != cb.co_nlocals
+            or ca.co_stacksize != cb.co_stacksize or ca.co_exceptiontable != cb.co_exceptiontable
+            or ca.co_name != cb.co_name or ca.co_qualname != cb.co_qualname
+            or len(ca.co_varnames) != len(cb.co_varnames) or len(ca.co_cellvars) != len(cb.co_cellvars)
+            or len(ca.co_freevars) != len(cb.co_freevars)):
+        return False
+    if _FRAME_NAMES.intersection(ca.co_names) or _FRAME_ATTRS.intersection(ca.co_names):
+        return False
+    npar = ca.co_argcount + ca.co_kwonlyargcount + bool(ca.co_flags & 0x04) + bool(ca.co_flags & 0x08)
+    if ca.co_varnames[:npar] != cb.co_varnames[:npar]:
+        return False
+    if len(ca.co_consts) != len(cb.co_consts):
+        return False
+    for x, y in zip(ca.co_consts, cb.co_consts):
+        if isinstance(x, type(ca)):
+            if not isinstance(y, type(ca)) or not _code_equal(x, y):
+                return False
+        elif type(x) is not type(y) or repr(x) != repr(y):
+            return False
+    return True
+
+
+# ----------------------------------------------------------- reordered imports
+_PINNED_ROOTS = {"sqlglot", "tests", "__future__"}
+
+
+def _plain_import(s):
+    """Names an import of a module outside sqlglot and the tests binds, else None."""
+    if isinstance(s, ast.Import):
+        if any(al.name.split(".")[0] in _PINNED_ROOTS for al in s.names):
+            return None
+        return [al.asname or al.name.split(".")[0] for al in s.names]
+    if isinstance(s, ast.ImportFrom):
+        if s.level or not s.module or s.module.split(".")[0] in _PINNED_ROOTS:
+            return None
+        if any(al.name == "*" for al in s.names):
+            return None
+        return [al.asname or al.name for al in s.names]
+    return None
+
+
+def _permuted_imports(ba: list, bb: list) -> set:
+    """Indexes of a contiguous run of module-level imports that the change only
+    reorders (outside sqlglot, each name bound once): the module ends up with
+    the same bindings to the same already-importable modules. Empty if none."""
+    if len(ba) != len(bb):
+        return set()
+    da = [_dump(x) for x in ba]
+    db = [_dump(x) for x in bb]
+    diff = [i for i in range(len(ba)) if da[i] != db[i]]
+    if not diff:
+        return set()
+    run = range(diff[0], diff[-1] + 1)
+    names: list = []
+    for i in run:
+        na, nb = _plain_import(ba[i]), _plain_import(bb[i])
+        if na is None or nb is None:
+            return set()
+        names += na
+    if len(names) != len(set(names)) or sorted(da[i] for i in run) != sorted(db[i] for i in run):
+        return set()
+    return set(run)
+
+
 def _future_annotations(tree) -> bool:
     return any(isinstance(s, ast.ImportFrom) and s.module == "__future__" and any(a.name == "annotations" for a in s.names)
                for s in tree.body)
@@ -410,6 +687,9 @@ def analyze(old_src: str | None, new_src: str | None, old_changed=None, new_chan
     defs = _future_annotations(a) and _future_annotations(b)
     _strip_annotations(a, defs)
     _strip_annotations(b, defs)
-    _Walker(c, (old_src or "").split("\n"), (new_src or "").split("\n")).seq(a.body, b.body, (a,), None, a)
+    skip = _permuted_imports(a.body, b.body)
+    ba = [x for i, x in enumerate(a.body) if i not in skip]
+    bb = [x for i, x in enumerate(b.body) if i not in skip]
+    _Walker(c, (old_src or "").split("\n"), (new_src or "").split("\n"), old_src, new_src).seq(ba, bb, (a,), None, a)
     c.semantic = bool(c.runtime_lines or c.import_time or c.def_changes or c.import_lines)
     return c

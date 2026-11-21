@@ -1297,7 +1297,7 @@ class _Timeout(BaseException):
     pass
 
 
-TIMED_OUT = [False]  # once anything timed out, verify nothing more: include the rest
+TIMED_OUT = [False]  # debug: some verification timed out
 SETUP_LIMIT = float(os.environ.get("BR_SETUP_LIMIT", "15"))  # class/module set-up and tear-down
 
 
@@ -1403,9 +1403,6 @@ def run_tests(nums: list[int], split: dict | None = None) -> tuple[set, set]:
         # attribute, so cut no TPC query list in that case)
         _apply_split(split, tpc=not any(n in SPLIT_NUMS and n not in split for n in nums))
     for items, suite in suites:
-        if TIMED_OUT[0]:  # something hangs: do not pay for it again
-            failing |= {n for n, _ in items}
-            continue
         res = R()
         try:
             signal.setitimer(signal.ITIMER_REAL, SETUP_LIMIT)
@@ -1557,9 +1554,6 @@ def fe_check_queries(vfe: dict) -> tuple[set, dict]:
     for n, (attr, idx, nq, c, _m) in vfe.items():
         tid = SPLIT_NUMS[n]
         fe = fe_maps().get(tid) or {}
-        if TIMED_OUT[0]:
-            failing.add(n)
-            continue
         try:
             # a front end that hangs counts as differing
             signal.setitimer(signal.ITIMER_REAL, 5.0 + 4.0 * c)
