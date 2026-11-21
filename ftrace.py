@@ -3,9 +3,10 @@
 Per test: the front-end artifact fingerprints of every query (computed in a
 fresh process per query and again in one process in order; queries whose
 fingerprints differ between the two count as unstable), the CPU each costs,
-and the lines the test executes outside its front end: setUpClass, the
-Python executor, result pickling, DuckDB and comparison glue. A change that
-touches any of those lines cannot be judged from fingerprints.
+and the lines the test executes outside its front end (parse, find_tables,
+optimize, the debug-log render, plan, transpile): setUpClass, the Python
+executor, result pickling, DuckDB and comparison glue. A change that touches
+any of those lines cannot be judged from fingerprints.
 
 usage: python ftrace.py SQLGLOT_ROOT OUT.json
 """
@@ -139,8 +140,22 @@ def exec_lines(tid):
 
     te.parse_one = off(te.parse_one)
     te.transpile = off(te.transpile)
+    te.find_tables = off(te.find_tables)
     sx.optimize = off(sx.optimize)
     sx.Plan = off(sx.Plan)
+    # execute() renders the optimized query for a debug log line; tpcfp.py
+    # repeats that call (only an exception from it can change the outcome)
+    from sqlglot.expressions import core
+
+    plain_sql = core.Expression.sql
+    quiet_sql = off(plain_sql)
+
+    def sql(self, *a, **k):
+        if sys._getframe(1).f_code.co_filename.endswith("sqlglot/executor/__init__.py"):
+            return quiet_sql(self, *a, **k)
+        return plain_sql(self, *a, **k)
+
+    core.Expression.sql = sql
     name = tid.split("::")
     suite = unittest.TestLoader().loadTestsFromName("tests.test_executor." + ".".join(name[1:]))
     mon.use_tool_id(TOOL, "ftrace")

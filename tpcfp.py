@@ -3,11 +3,12 @@
 test_execute_tpcds (and its TPC-H siblings) spends almost all of its time
 running each query twice over fixed data: once in sqlglot's Python executor,
 once in DuckDB on sqlglot's transpiled SQL. What sqlglot contributes before
-that is cheap: parse, pickle round trip, optimize, plan, transpile. When a
-change only reaches that front end, it can only alter the outcome by altering
-what the front end hands over. So the selector recomputes those artifacts
-with the patched code and compares them with the pinned commit's: identical
-artifacts, with the execution-side code untouched, mean identical results.
+that is cheap: parse, pickle round trip, find_tables, optimize, plan,
+transpile. When a change only reaches that front end, it can only alter the
+outcome by altering what the front end hands over. So the selector
+recomputes those artifacts with the patched code and compares them with the
+pinned commit's: identical artifacts, with the execution-side code untouched,
+mean identical results.
 
 `artifacts()` must mirror the tests exactly; it is shared by the build-time
 recorder (ftrace.py) and the selector.
@@ -117,12 +118,17 @@ def artifacts(tid: str, i: int, sqls=None) -> list:
     e2 = pickle.loads(pickle.dumps(e, protocol=pickle.HIGHEST_PROTOCOL))
     out = [fp(e2)]
     if meta.get("execute"):
-        # ... where sqlglot.executor.execute optimizes and plans it
+        # ... where mp_execute picks the tables find_tables names (by name) ...
+        from sqlglot import find_tables
         from sqlglot.executor import optimize, Plan
         from sqlglot.schema import ensure_schema
 
+        out.append(fp(sorted(t.name for t in find_tables(e2))))
+        # ... and sqlglot.executor.execute optimizes, renders for its debug
+        # log (only whether that raises matters) and plans it
         schema = ensure_schema(getattr(helpers, SCHEMAS[attr]), dialect=None)
         o = optimize(e2, schema, leave_tables_isolated=True, dialect=None)
+        o.sql(pretty=True)
         out.append(fp(Plan(o)))
         # DuckDB side (cached_execute)
         out.append(fp(transpile(sql, write="duckdb")[0]))

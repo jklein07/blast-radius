@@ -28,6 +28,8 @@ class PyChange:
     semantic: bool = False
     runtime_lines: set = field(default_factory=set)  # old line numbers; negative = function entry
     import_time: bool = False
+    # import-time differences other than a def's header (args, decorators ...)
+    other_import: bool = False
     import_lines: set = field(default_factory=set)  # old lines of import-time diffs
     def_changes: list = field(default_factory=list)  # (qualname, old_first, old_last) of defs whose header changed
     toplevel_names: set = field(default_factory=set)  # names bound by changed module/class level statements
@@ -191,6 +193,7 @@ class _Walker:
             self.c.runtime_lines |= lines
             self.c.plain_lines |= lines
             self.c.import_time = True
+            self.c.other_import = True
             self._bind(n, ctx)
             return
         if fn is not None:
@@ -234,6 +237,7 @@ class _Walker:
             return
         # import-time difference
         self.c.import_time = True
+        self.c.other_import = True
         if hasattr(n, "lineno"):
             self.c.import_lines |= set(range(n.lineno, (getattr(n, "end_lineno", None) or n.lineno) + 1))
         if isinstance(n, ast.ClassDef):
@@ -344,14 +348,17 @@ def analyze(old_src: str | None, new_src: str | None, old_changed=None, new_chan
         c.syntax_error = True
         c.semantic = True
         c.import_time = True
+        c.other_import = True
         return c
     if new_src is None:  # file deleted
         c.semantic = True
         c.import_time = True
+        c.other_import = True
         return c
     if a is None:
         c.semantic = True
         c.import_time = True
+        c.other_import = True
         return c
     import re
 
@@ -361,6 +368,7 @@ def analyze(old_src: str | None, new_src: str | None, old_changed=None, new_chan
     if ha != hb:
         c.semantic = True
         c.import_time = True
+        c.other_import = True
     if old_src == new_src:
         # also compare the encoding-sensitive bits: the module docstring etc. are in the AST already
         return c

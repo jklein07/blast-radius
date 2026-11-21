@@ -25,6 +25,7 @@ no table from patches or kinds of edit to failing tests.
 from __future__ import annotations
 
 import gzip
+import itertools
 import json
 import os
 import signal
@@ -535,24 +536,43 @@ def choose_verify(cands: dict, already_forked: bool, split: dict | None = None) 
                 extra = setup_cost(n)
             pre.append(pre[-1] + vc(n) + extra)
             pn.append(pn[-1] * (1.0 - cands[n]))
-        vb = sum(vc(n) + sc(n) for n in B)
-        pb = 1.0
-        for n in B:
-            pb *= 1.0 - cands[n]
+        # verify any subset V of them; each fails on its own, and the schedule
+        # then holds exactly the ones of V that failed (plus those not verified)
+        subsets = [c for r in range(1, len(B) + 1) for c in itertools.combinations(B, r)]
         for k2 in sorted({0, 1, 2, 3, 5, 8, 12, 20, 30, m2 // 2, m2} & set(range(m2 + 1))):
             U = fixed + nb[k2:]
             P = nb[:k2]
-            s_u = sched_cost_ms(U) / 1000.0
-            s_ub = sched_cost_ms(U + B) / 1000.0
-            if k2:
-                s_up = sched_cost_ms(U + P) / 1000.0
-                s_upb = sched_cost_ms(U + P + B) / 1000.0
-            else:
-                s_up, s_upb = s_u, s_ub
-            cost = ovh + pre[k2] + vb + pb * (pn[k2] * s_u + (1 - pn[k2]) * s_up) + (1 - pb) * (pn[k2] * s_ub + (1 - pn[k2]) * s_upb)
-            if cost < best[0] - 1e-9:
-                best = (cost, k2)
-                choice = (P + B, U)
+            memo: dict = {}
+
+            def s(extra: tuple, with_p: bool) -> float:
+                if (extra, with_p) not in memo:
+                    memo[extra, with_p] = sched_cost_ms(U + (P if with_p else []) + list(extra)) / 1000.0
+                return memo[extra, with_p]
+
+            for V in subsets:
+                rest = tuple(n for n in B if n not in V)
+                vv = sum(vc(n) for n in V)
+                seen_v: set = set()
+                for n in V:
+                    if sc(n) and _cls(n) not in seen_v:
+                        seen_v.add(_cls(n))
+                        vv += setup_cost(n)
+                expect = 0.0
+                for mask in range(1 << len(V)):
+                    pf = 1.0
+                    failed = list(rest)
+                    for i, n in enumerate(V):
+                        if mask >> i & 1:
+                            pf *= cands[n]
+                            failed.append(n)
+                        else:
+                            pf *= 1.0 - cands[n]
+                    key_ = tuple(sorted(failed))
+                    expect += pf * (pn[k2] * s(key_, False) + ((1 - pn[k2]) * s(key_, True) if k2 else 0.0))
+                cost = ovh + pre[k2] + vv + expect
+                if cost < best[0] - 1e-9:
+                    best = (cost, k2)
+                    choice = (P + list(V), U + list(rest))
     return choice
 
 
@@ -1023,7 +1043,10 @@ def snapshot_candidates(pristine: dict, patched: dict, diff: dict, plan: Plan) -
         mod = module_of(rel)
         if seen_mods & importer_closure({mod}):
             continue
-        plan.unseen = True  # tests chosen by name, not by a measured difference
+        if ch.other_import:
+            # tests chosen by name, not by a measured difference (a def header
+            # alone is not: what runs it is known from coverage)
+            plan.unseen = True
         for name in ch.toplevel_names:
             out |= global_ref_tests(mod, name)
         for q in ch.class_quals:
