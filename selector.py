@@ -305,6 +305,7 @@ def vcost(n: int) -> float:
 XS_CLS = "tests/test_executor.py::TestExecutor"
 XS_FRAC = float(os.environ.get("BR_XS_FRAC", "0.15"))
 XS_ON: list = [False]
+NO_VERIFY: list = [False]  # set per commit before choose_verify (Plan.no_verify)
 
 
 def xs_files_ok(files) -> bool:
@@ -538,8 +539,8 @@ def cf_maps() -> dict:
 
 def cf_pairs(n: int, plan) -> tuple | None:
     """("@cf", pair indexes, pair count, CPU cost, "run") when test n can be
-    verified on only the fixture pairs that execute a changed line (none,
-    when only its own code outside the pairs does); None to run it whole."""
+    verified on only the fixture pairs that execute a changed line; None to
+    run it whole (also when its own code outside the pairs runs one)."""
     m = CF_NUMS.get(n)
     if m is None or n in plan.cands.other:
         return None
@@ -562,9 +563,10 @@ def cf_pairs(n: int, plan) -> tuple | None:
                 return None  # setUpClass runs it
             j = lm.get(str(l))
             if j is None:
-                if l in outside:
-                    continue  # the test's own code runs it, whichever pairs run
-                return None  # the test runs it, but no traced run did
+                # The test's own code runs it outside the pairs (or no traced
+                # run did): what it builds there, such as a schema every pair
+                # is given, can change any pair's result.
+                return None
             q |= int(masks[j], 16)
     nq = t["nq"]
     if q == (1 << nq) - 1:
@@ -624,7 +626,7 @@ def choose_verify(cands: dict, already_forked: bool, split: dict | None = None) 
     passes (probability 1 - p_i). Expected schedule cost is approximated as
     P(all verified pass) * S(include) + P(some fail) * S(include + verified).
     """
-    if not VERIFY:
+    if not VERIFY or NO_VERIFY[0]:
         return [], sorted(cands)
     split = split or {}
     fixed = sorted(n for n in cands if n in NOVERIFY and n not in split)
@@ -751,6 +753,7 @@ class Plan:
         self.cid = cid
         self.cands = Cands()
         self.need_snapshot = False
+        self.no_verify = False  # keep every candidate unverified (sort removed)
         self.all_tests = False  # include everything, unverified
         self.files: dict[str, str | None] = {}  # rel path -> new text (None = deleted)
         self.py_changes: dict[str, astdiff.PyChange] = {}
@@ -912,6 +915,18 @@ def analyze(cid: str, text: str) -> Plan:
             plan.all_tests = True
             plan.notes.append(f"cannot apply {fp.path}: {e}")
             continue
+        if new_rel and new_rel.endswith(".py") and (fp.is_new or old_rel != new_rel):
+            top = new_rel[:-3] if "/" not in new_rel else (new_rel[:-12] if new_rel.endswith("/__init__.py") and new_rel.count("/") == 1 else "")
+            if top in getattr(sys, "stdlib_module_names", ()) or top in ("sitecustomize", "usercustomize"):
+                # on sys.path ahead of the standard library (or run at start-up)
+                plan.all_tests = True
+                plan.notes.append(f"new top-level module {new_rel}")
+        if (old is not None and new is not None and (new_rel or "").startswith("sqlglot/") and new_rel.endswith(".py")
+                and old.count("sorted(") + old.count(".sort(") > new.count("sorted(") + new.count(".sort(")):
+            # Output may now follow set or dict order, which the hash seed
+            # decides: a child verifies under one seed, pytest under others
+            plan.no_verify = True
+            plan.notes.append(f"sort removed in {new_rel}: no verification")
         if old_rel and new_rel and old_rel != new_rel:
             plan.files[old_rel] = None
         if new_rel:
@@ -2795,6 +2810,7 @@ def child_main(plan: Plan, wfd: int) -> None:
             if getattr(plan, "import_errors", None):
                 split = {n: v for n, v in split.items() if v[4] != "fe"}
             XS_ON[0] = xs_files_ok(plan.files)
+            NO_VERIFY[0] = plan.no_verify
             verify, include = choose_verify(cands, True, split)
             vsplit = {n: v for n, v in split.items() if n in verify}
             vfe = {n: v for n, v in vsplit.items() if v[4] == "fe"}
@@ -2955,6 +2971,7 @@ def _main(st: dict) -> None:
             selections[cid] = []
         else:
             XS_ON[0] = xs_files_ok(p.files)
+            NO_VERIFY[0] = p.no_verify
             verify, include = choose_verify(p.cands, False, {n: v for n, v in p.split.items()})
             if not verify:
                 selections[cid] = include

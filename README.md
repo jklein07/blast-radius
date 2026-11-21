@@ -99,8 +99,12 @@ them across workers.
    generator transforms). Instead of guessing, a child imports the patched
    sqlglot and fingerprints every class attribute and module global
    (`fingerprint.py`). It compares them with the pristine fingerprint taken at
-   build time. Each changed `(class, attribute)` maps to the tests that read
-   that attribute through the class or a subclass. The tracer records those
+   build time. Nested containers are fingerprinted eight levels deep, except
+   tries (one character per level), which are fingerprinted to the end of
+   every key. A new keyword `"PARTITION BY RANGE"` changes how every text
+   starting with `PARTITION BY` is scanned, twelve levels down the
+   tokenizer's keyword trie. Each changed `(class, attribute)` maps to the
+   tests that read that attribute through the class or a subclass. The tracer records those
    reads by wrapping every class attribute in a recording descriptor. Each
    changed global maps to the tests that execute a line referring to it.
    One registry gets a closer look: a new expression class adds a key to
@@ -166,17 +170,23 @@ them across workers.
    which queries execute each line. When a change reaches only some of them,
    the test can be verified on those queries alone. The optimizer tests that
    check a rule against a fixture file get the same treatment per fixture
-   pair (`cftrace.py`, `cfsel.py`).
+   pair (`cftrace.py`, `cfsel.py`), unless the change reaches code the test
+   runs outside its pairs (a schema it builds for every pair, say): then it
+   runs whole.
 6. **Data files → file reads.** SQL fixtures and other files map to the tests
-   that opened them (or whose module opened them while importing).
+   that opened them (or whose module opened them while importing). A new
+   top-level module named like a standard-library module (or
+   `sitecustomize`) keeps every test: it comes first on `sys.path`.
 7. **Verify cheap candidates.** Candidates that cost little to run are run on
    a symlink copy of the patched tree in a forked child, and kept only if they
    fail. Expensive ones are kept unverified when that is cheaper. The cost
    model uses each test's measured CPU and its class setup, and a prior
    chance that a candidate fails (one constant per kind of reason it was
    chosen: 0.2 for code and import-time state, 0.5 for test-side changes,
-   0.9 for data files). Every verified
-   test runs under its own timer (three times its measured cost plus a
+   0.9 for data files). A child runs with one hash seed and pytest with
+   others, so a patch that takes a `sorted(` or `.sort(` out of sqlglot code
+   (output may then follow set order) keeps its candidates unverified. Every
+   verified test runs under its own timer (three times its measured cost plus a
    margin; 15 s for class setup); a test that runs out of time is kept,
    because a patch that makes a test hang makes it fail. A test stops at
    its first failing subtest: it has failed, and the rest would only cost

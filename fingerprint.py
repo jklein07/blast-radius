@@ -113,6 +113,16 @@ def _fp(v, depth: int, seen: set) -> str:
     return r
 
 
+def _is_trie(v: dict) -> bool:
+    has_char = False
+    for k, x in v.items():
+        if type(k) is str and len(k) == 1 and type(x) is dict:
+            has_char = True
+        elif not (type(k) is int and k == 0):
+            return False
+    return has_char
+
+
 def _expand(v, t, depth: int, seen: set, vid: int) -> str:
     try:
         if isinstance(v, (types.FunctionType,)):
@@ -145,7 +155,13 @@ def _expand(v, t, depth: int, seen: set, vid: int) -> str:
         if isinstance(v, functools.partial):
             return "Pa(" + _fp(v.func, depth - 1, seen) + _fp(v.args, depth - 1, seen) + _fp(v.keywords, depth - 1, seen) + ")"
         if isinstance(v, dict):
-            items = sorted(_fp(k, depth - 1, seen) + "=" + _fp(x, depth - 1, seen) for k, x in v.items())
+            # A trie node (sqlglot.trie: one character per level, 0 marks a
+            # complete key) passes its own depth to its children, so a key of
+            # any length is seen. A new multi-word keyword that extends an
+            # existing one ("PARTITION BY RANGE") changes how every text
+            # starting with the shorter one is scanned.
+            dd = depth if _is_trie(v) else depth - 1
+            items = sorted(_fp(k, depth - 1, seen) + "=" + _fp(x, dd, seen) for k, x in v.items())
             return f"D{t.__name__}{{" + ",".join(items) + "}"
         if isinstance(v, (list, tuple)):
             parts = [_fp(x, depth - 1, seen) for x in v]
