@@ -66,9 +66,39 @@ def in_child(fn):
 
 
 def exec_lines(tid):
-    """Lines the full test runs with its front-end calls switched off."""
+    """Lines the full test runs with its front-end calls switched off, and the
+    names of the sqlglot class attributes read meanwhile."""
+    import enum
+
     lines: dict = {}
     depth = [0]
+    attrs: set = set()
+    live = [False]
+
+    class _TA:  # records reads of a wrapped class attribute while the execution side runs
+        __slots__ = ("v", "k")
+
+        def __init__(self, v, k):
+            self.v = v
+            self.k = k
+
+        def __get__(self, obj, typ=None):
+            if live[0] and depth[0] == 0:
+                attrs.add(self.k)
+            return self.v
+
+    for _key, c in fingerprint.iter_classes(sorted(sys.modules), "sqlglot"):
+        if isinstance(c, enum.EnumMeta):
+            continue
+        for name, v in list(c.__dict__.items()):
+            if name.startswith("__") and name.endswith("__"):
+                continue
+            if hasattr(type(v), "__get__") and not isinstance(v, type):
+                continue
+            try:
+                setattr(c, name, _TA(v, name))
+            except Exception:  # noqa: BLE001
+                pass
 
     def on_line(code, line):
         f = code.co_filename
@@ -109,11 +139,35 @@ def exec_lines(tid):
     mon.register_callback(TOOL, mon.events.PY_START, on_start)
     mon.set_events(TOOL, EV)
     res = unittest.TestResult()
+    live[0] = True
     try:
         suite.run(res)
     finally:
+        live[0] = False
         mon.set_events(TOOL, 0)
-    return {"failed": bool(res.failures or res.errors), "lines": {f: sorted(v) for f, v in lines.items()}}
+    # every identifier (or identifier-like string) on the lines the execution side ran
+    import io
+    import tokenize
+
+    names: set = set()
+    for f, ls in lines.items():
+        try:
+            src = open(os.path.join(ROOT, f), encoding="utf-8").read().split("\n")
+        except OSError:
+            continue
+        for ln in ls:
+            if ln <= 0 or ln > len(src):
+                continue
+            try:
+                for tok in tokenize.generate_tokens(io.StringIO(src[ln - 1] + "\n").readline):
+                    if tok.type == tokenize.NAME:
+                        names.add(tok.string)
+                    elif tok.type == tokenize.STRING:
+                        names.update(w for w in __import__("re").findall(r"[A-Za-z_][A-Za-z0-9_]*", tok.string))
+            except (tokenize.TokenError, IndentationError, SyntaxError):
+                names.update(__import__("re").findall(r"[A-Za-z_][A-Za-z0-9_]*", src[ln - 1]))
+    return {"failed": bool(res.failures or res.errors), "lines": {f: sorted(v) for f, v in lines.items()},
+            "attrs": sorted(attrs), "names": sorted(names)}
 
 
 def main():
@@ -143,9 +197,10 @@ def main():
         e = in_child(lambda: exec_lines(tid))
         if e.get("failed") or "error" in e:
             raise SystemExit(f"{tid}: test run failed while tracing: {e.get('error')}")
-        out[tid] = {"attr": attr, "nq": n, "arts": fresh, "unstable": unstable, "cpu": s["cpu"], "exec": e["lines"]}
+        out[tid] = {"attr": attr, "nq": n, "arts": fresh, "unstable": unstable, "cpu": s["cpu"], "exec": e["lines"],
+                    "exec_attrs": e["attrs"], "exec_names": e["names"]}
         print(tid.split("::")[-1], "queries", n, "unstable", unstable, "exec lines", sum(len(v) for v in e["lines"].values()),
-              "cpu", round(sum(s["cpu"].values()), 2), file=sys.stderr, flush=True)
+              "cpu", round(sum(s["cpu"].values()), 2), "exec attrs", len(e["attrs"]), "names", len(e["names"]), file=sys.stderr, flush=True)
     with open(OUT, "w") as fh:
         json.dump(out, fh)
 

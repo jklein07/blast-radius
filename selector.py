@@ -875,6 +875,7 @@ def snapshot_candidates(pristine: dict, patched: dict, diff: dict, plan: Plan) -
         mod = module_of(rel)
         if seen_mods & importer_closure({mod}):
             continue
+        plan.unseen = True  # tests chosen by name, not by a measured difference
         for name in ch.toplevel_names:
             out |= global_ref_tests(mod, name)
         for q in ch.class_quals:
@@ -1096,6 +1097,82 @@ def run_tests(nums: list[int], split: dict | None = None) -> tuple[set, set]:
 TESTS_BY_NUM = {t["number"]: t for t in TESTS}
 
 
+def _mod_rel(mod: str) -> str:
+    rel = mod.replace(".", "/")
+    return rel + "/__init__.py" if os.path.isfile(os.path.join(PRISTINE, rel, "__init__.py")) else rel + ".py"
+
+
+_DEFS: dict = {}
+
+
+def _def_span(rel: str, qual: str):
+    """(first, last) line of the function `qual` (dotted path) in the
+    pristine source of rel, or None if it is not a def there."""
+    k = (rel, qual)
+    if k not in _DEFS:
+        import ast
+
+        span = None
+        try:
+            body = ast.parse(read_pristine(rel) or "").body
+            node = None
+            for part in qual.split("."):
+                node = next((x for x in body if isinstance(x, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)) and x.name == part), None)
+                if node is None:
+                    break
+                body = node.body
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                span = (astdiff._first(node), node.end_lineno)
+        except Exception:  # noqa: BLE001
+            span = None
+        _DEFS[k] = span
+    return _DEFS[k]
+
+
+def fe_import_ok(n: int, d: dict, plan) -> bool:
+    """Can the fingerprint check also vouch for test n under this import-time
+    diff? Only if nothing that changed is used by the test's execution side:
+    changed functions never run there, changed values are never read there."""
+    if getattr(plan, "unseen", False) or d.get("errors"):
+        return False
+    fe = fe_maps().get(SPLIT_NUMS.get(n, ""))
+    if not fe or "exec_names" not in fe:
+        return False
+    ex = fe["_exec"]
+    xa = set(fe.get("exec_attrs", ()))
+    xn = set(fe.get("exec_names", ()))
+
+    def runs_there(rel, span):
+        return any(span[0] <= abs(l) <= span[1] for l in ex.get(rel, ()))
+
+    for key, attr in d["attrs"]:
+        if attr == "__doc__":
+            continue
+        if attr == "*" or attr.startswith("__"):
+            return False
+        mod, _, qual = key.partition(":")
+        rel = _mod_rel(mod)
+        span = _def_span(rel, f"{qual}.{attr}")
+        if span is not None:
+            if runs_there(rel, span):
+                return False
+            continue
+        if attr in xa or attr in xn:
+            return False
+    gmods = {m for m, _ in d["globals"]}
+    for mod, name in d["globals"]:
+        if name == "__doc__":
+            continue
+        spans = [(r, sp) for r, sp in ((_mod_rel(m), _def_span(_mod_rel(m), name)) for m in gmods) if sp is not None]
+        if spans:  # a function (possibly imported under the same name elsewhere)
+            if any(runs_there(r, sp) for r, sp in spans):
+                return False
+            continue
+        if name in xn:
+            return False
+    return True
+
+
 def fe_check(vfe: dict) -> set:
     """Tests whose front-end artifacts differ from the pinned commit's on
     one of their queries (or cannot be computed): those count as failing."""
@@ -1144,6 +1221,23 @@ def child_main(plan: Plan, wfd: int) -> None:
             result["verified"] = 0
         else:
             split = {n: v for n, v in plan.split.items() if n not in cands.other}
+            if plan.need_snapshot and not everything:
+                # TPC tests reached through import-time state: still decidable
+                # from front-end fingerprints when nothing changed is used by
+                # their execution side (all queries are checked)
+                for n in SPLIT_NUMS:
+                    if n not in cands or n in plan.cands.other:
+                        continue
+                    if n in plan.cands and (plan.split.get(n) or (None,) * 5)[4] != "fe":
+                        continue
+                    if not fe_import_ok(n, d, plan):
+                        continue
+                    sm = split_maps().get("tests", {}).get(SPLIT_NUMS[n])
+                    fe = fe_maps().get(SPLIT_NUMS[n])
+                    if not sm or fe.get("nq") != sm["nq"] or fe.get("unstable"):
+                        continue
+                    nq = sm["nq"]
+                    split[n] = (sm["attr"], list(range(nq)), nq, round(0.3 + sum(fe["cpu"].values()), 3), "fe")
             verify, include = choose_verify(cands, True, split)
             vsplit = {n: v for n, v in split.items() if n in verify}
             vfe = {n: v for n, v in vsplit.items() if v[4] == "fe"}
