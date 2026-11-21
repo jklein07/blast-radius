@@ -271,6 +271,49 @@ class _Walker:
                     self.c.toplevel_names.add((al.asname or al.name).split(".")[0])
 
 
+def _future_annotations(tree) -> bool:
+    return any(isinstance(s, ast.ImportFrom) and s.module == "__future__" and any(a.name == "annotations" for a in s.names)
+               for s in tree.body)
+
+
+class _Annotations(ast.NodeTransformer):
+    """Blank annotations that never run. Under `from __future__ import
+    annotations` a def's argument and return annotations become strings in
+    its __annotations__, which nothing in sqlglot or its tests reads; an
+    annotated assignment inside a function never evaluates its annotation
+    (CPython compiles it away). Class- and module-level annotations stay:
+    dataclasses, NamedTuple and TypedDict read those."""
+
+    def __init__(self, defs: bool):
+        self.defs = defs
+        self.depth = 0
+
+    def visit_FunctionDef(self, n):
+        if self.defs:
+            n.returns = None
+            a = n.args
+            for x in a.posonlyargs + a.args + a.kwonlyargs + [y for y in (a.vararg, a.kwarg) if y is not None]:
+                x.annotation = None
+        self.depth += 1
+        self.generic_visit(n)
+        self.depth -= 1
+        return n
+
+    visit_AsyncFunctionDef = visit_FunctionDef
+
+    def visit_ClassDef(self, n):
+        saved, self.depth = self.depth, 0  # a class body is its own (class) scope
+        self.generic_visit(n)
+        self.depth = saved
+        return n
+
+    def visit_AnnAssign(self, n):
+        if self.depth > 0:
+            n.annotation = ast.Constant(value=None)
+        self.generic_visit(n)
+        return n
+
+
 def _noop(x) -> bool:
     return isinstance(x, ast.Expr) and isinstance(x.value, ast.Constant)
 
@@ -321,6 +364,9 @@ def analyze(old_src: str | None, new_src: str | None, old_changed=None, new_chan
     if old_src == new_src:
         # also compare the encoding-sensitive bits: the module docstring etc. are in the AST already
         return c
+    defs = _future_annotations(a) and _future_annotations(b)
+    _Annotations(defs).visit(a)
+    _Annotations(defs).visit(b)
     _Walker(c, (old_src or "").split("\n"), (new_src or "").split("\n")).seq(a.body, b.body, (a,), None, a)
     c.semantic = bool(c.runtime_lines or c.import_time or c.def_changes or c.import_lines)
     return c
