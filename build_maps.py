@@ -177,6 +177,49 @@ for m, names in mod_names.items():
             refs.add((f, ln))
         out_m[g] = sorted(refs)
 
+# every import statement of a sqlglot module or name: "mod" / "mod|name" ->
+# [file, first line, last line, 1 if it runs at import time (module or class
+# level) else 0]. When a module or a name disappears, the tests that run such
+# a statement fail (function-level), or the whole test file does (test module
+# level); the snapshot sees only sqlglot's own import-time imports.
+import_sites: dict[str, list] = {}
+for f, tree in trees.items():
+    if not (f.startswith("sqlglot/") or f.startswith("tests/")):
+        continue
+    me = modname(f)
+    pkg = me if f.endswith("__init__.py") else me.rpartition(".")[0]
+
+    def _site(key, n, top):
+        if key.startswith("sqlglot"):
+            import_sites.setdefault(key, []).append([f, n.lineno, n.end_lineno or n.lineno, 1 if top else 0])
+
+    def _visit(node, top):
+        for n in ast.iter_child_nodes(node):
+            if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+                _visit(n, False)
+                continue
+            if isinstance(n, ast.Import):
+                for a in n.names:
+                    parts = a.name.split(".")
+                    for i in range(1, len(parts) + 1):
+                        _site(".".join(parts[:i]), n, top)
+            elif isinstance(n, ast.ImportFrom):
+                base = n.module or ""
+                if n.level:
+                    parts = pkg.split(".")
+                    up = parts[: len(parts) - (n.level - 1)] if n.level > 1 else parts
+                    base = ".".join(up + ([n.module] if n.module else []))
+                parts = base.split(".")
+                for i in range(1, len(parts) + 1):
+                    _site(".".join(parts[:i]), n, top)
+                for a in n.names:
+                    if a.name != "*":
+                        _site(f"{base}|{a.name}", n, top)
+                        _site(f"{base}.{a.name}", n, top)  # when the name is a submodule
+            _visit(n, top)
+
+    _visit(tree, True)
+
 # import-time module graph of sqlglot: module -> sqlglot modules it imports
 # at module or class level (function-level imports run later, not at import)
 def _toplevel_imports(tree, me, is_pkg):
@@ -304,6 +347,7 @@ maps = {
     "import_lines": import_lines,
     "names": names_index,
     "defs": defs,
+    "import_sites": import_sites,
     "test_importers": {k: sorted(v) for k, v in importers.items()},
     "noverify": sorted(noverify),
     "cpu": {str(k): v for k, v in cpu.items()},

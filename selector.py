@@ -970,6 +970,12 @@ def snapshot_candidates(pristine: dict, patched: dict, diff: dict, plan: Plan) -
         if name == "__doc__":
             continue
         out |= global_ref_tests(mod, name)
+        if name == "*":  # the module is gone (or new)
+            out |= import_site_tests(mod, True)
+        else:
+            gone = name in ((pristine.get("globals") or {}).get(mod) or {}) and name not in ((patched.get("globals") or {}).get(mod) or {})
+            out |= import_site_tests(f"{mod}|{name}", gone)
+            out |= import_site_tests(f"{mod}.{name}", gone)
     # import-time edits the fingerprints could not see: fall back to everything
     # that refers to the names those statements bind
     seen_mods = {k.partition(":")[0] for k, _ in diff["attrs"]} | {m for m, _ in diff["globals"]}
@@ -1037,6 +1043,24 @@ def method_lines(key: str, attr: str, pristine: dict, patched: dict):
         sid = CLASSUSE.get(x)
         if sid is not None:
             fam.update(SETS[sid])
+    return out
+
+
+IMPORT_SITES: dict = M.get("import_sites", {})
+
+
+def import_site_tests(key: str, gone: bool) -> set:
+    """Tests that run an import statement of key ("mod" or "mod|name") inside
+    a function, and (when the module or name is gone) every test of a test
+    file importing it at module level: that file no longer imports."""
+    out: set = set()
+    for f, a, b, top in IMPORT_SITES.get(key, ()):
+        if not top:
+            out |= cov_tests(f, list(range(a, b + 1)))
+        elif gone and f.startswith("tests/"):
+            out.update(BY_FILE.get(f, ()))
+            for imp in TEST_IMPORTERS.get(f, []):
+                out.update(BY_FILE.get(imp, ()))
     return out
 
 
