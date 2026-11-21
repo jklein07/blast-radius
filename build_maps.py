@@ -183,6 +183,30 @@ for m, names in mod_names.items():
 # a statement fail (function-level), or the whole test file does (test module
 # level); the snapshot sees only sqlglot's own import-time imports.
 import_sites: dict[str, list] = {}
+# packages that load names lazily (PEP 562 __getattr__): name -> (module, attr),
+# read from the pristine checkout itself
+lazy_attrs: dict[str, dict[str, tuple[str, str]]] = {}
+_saved_path = list(sys.path)
+try:
+    import importlib
+    import subprocess
+
+    _code = (
+        "import json, sys; sys.path.insert(0, sys.argv[1]); import importlib; out = {}\n"
+        "d = importlib.import_module('sqlglot.dialects')\n"
+        "out['sqlglot.dialects'] = {n: ['sqlglot.dialects.' + m, n] for n, m in getattr(d, 'MODULE_BY_ATTRIBUTE', {}).items()}\n"
+        "o = importlib.import_module('sqlglot.optimizer')\n"
+        "out['sqlglot.optimizer'] = {n: list(v) for n, v in getattr(o, '_LAZY_ATTRS', {}).items()}\n"
+        "print(json.dumps(out))\n"
+    )
+    _r = subprocess.run([sys.executable, "-c", _code, root], capture_output=True, text=True, timeout=120,
+                        env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"})
+    lazy_attrs = {k: {n: tuple(v) for n, v in d.items()} for k, d in json.loads(_r.stdout.strip().splitlines()[-1]).items()}
+except Exception as e:  # noqa: BLE001
+    raise SystemExit(f"cannot read the lazy-import maps: {e!r}")
+finally:
+    sys.path[:] = _saved_path
+print("lazy attrs", {k: len(v) for k, v in lazy_attrs.items()}, file=sys.stderr)
 for f, tree in trees.items():
     if not (f.startswith("sqlglot/") or f.startswith("tests/")):
         continue
@@ -216,6 +240,12 @@ for f, tree in trees.items():
                     if a.name != "*":
                         _site(f"{base}|{a.name}", n, top)
                         _site(f"{base}.{a.name}", n, top)  # when the name is a submodule
+                        lz = lazy_attrs.get(base, {}).get(a.name)
+                        if lz:  # imported through the package's __getattr__
+                            lp = lz[0].split(".")
+                            for i in range(1, len(lp) + 1):
+                                _site(".".join(lp[:i]), n, top)
+                            _site(f"{lz[0]}|{lz[1]}", n, top)
             _visit(n, top)
 
     _visit(tree, True)
@@ -348,6 +378,7 @@ maps = {
     "names": names_index,
     "defs": defs,
     "import_sites": import_sites,
+    "lazy_attrs": {k: {n: list(v) for n, v in d.items()} for k, d in lazy_attrs.items()},
     "test_importers": {k: sorted(v) for k, v in importers.items()},
     "noverify": sorted(noverify),
     "cpu": {str(k): v for k, v in cpu.items()},

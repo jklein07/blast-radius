@@ -922,11 +922,49 @@ def dict_key_tests(key: str, attr: str, live: dict) -> set | None:
 def snapshot_candidates(pristine: dict, patched: dict, diff: dict, plan: Plan) -> tuple[set, bool]:
     """Tests affected by changed import-time state. Returns (tests, everything)."""
     out: set = set()
-    if diff["errors"]:
-        new_err = {m for m, _ in diff["errors"] if m in patched["errors"]}
-        if new_err:
-            return set(ALL), True
+    new_err = {m for m, _ in diff["errors"] if m in patched["errors"]} if diff["errors"] else set()
+    if new_err and ("sqlglot" in new_err or not PRECISE_ERR):
+        return set(ALL), True
     subtree = class_subtree(pristine, patched)
+    if new_err:
+        # modules that no longer import, and every submodule of a package that
+        # does not: like deleted modules, whatever uses them fails (the root
+        # package still imports, or snapshot() itself raised and the child
+        # falls back to everything)
+        plan.import_errors = set(new_err)
+        gone = set(new_err) | {m for m in pristine["globals"] if any(m.startswith(f + ".") for f in new_err)}
+        for m in gone:
+            out |= global_ref_tests(m, "*")
+            out |= import_site_tests(m, True)
+            # names a package loads from it lazily (sqlglot.dialects.Snowflake):
+            # every attribute access of them
+            for pkg, names in LAZY_ATTRS.items():
+                for n, (tm, ta) in names.items():
+                    if tm == m:
+                        out |= global_ref_tests(m, ta)
+                        for f, ln in NAMES.refs(pkg, n):
+                            out |= cov_tests(f, [ln])
+            # tests that list its folder may import every module in it
+            sid = DIRREADS.get(os.path.dirname(_mod_rel(m)))
+            if sid is not None:
+                out.update(SETS[sid])
+        # and measured, not inferred: import every test module from the patched
+        # tree, as pytest's collection does before any test runs. A test file
+        # that no longer imports fails whole, whatever chain broke it.
+        import importlib
+
+        for tf in sorted(BY_FILE):
+            try:
+                importlib.import_module(tf[:-3].replace("/", "."))
+            except BaseException:  # noqa: BLE001
+                out.update(BY_FILE[tf])
+                plan.notes.append(f"collect fails {tf}")
+            for key in pristine["classes"]:
+                if key.partition(":")[0] == m:
+                    for x in subtree(key):
+                        sid = CLASSUSE.get(x)
+                        if sid is not None:
+                            out.update(SETS[sid])
 
     live = None
     for key, attr in diff["attrs"]:
@@ -1047,6 +1085,8 @@ def method_lines(key: str, attr: str, pristine: dict, patched: dict):
 
 
 IMPORT_SITES: dict = M.get("import_sites", {})
+LAZY_ATTRS: dict = M.get("lazy_attrs", {})  # package -> name -> [module, attr] (PEP 562 __getattr__)
+PRECISE_ERR = os.environ.get("BR_PRECISE_ERR", "1") == "1"  # 0: any new import error selects everything
 
 
 def import_site_tests(key: str, gone: bool) -> set:
@@ -1058,6 +1098,9 @@ def import_site_tests(key: str, gone: bool) -> set:
         if not top:
             out |= cov_tests(f, list(range(a, b + 1)))
         elif gone and f.startswith("tests/"):
+            if f.endswith("__init__.py"):  # every test module of the package imports it
+                d = os.path.dirname(f) + "/"
+                out.update(n for tf, ns in BY_FILE.items() if tf.startswith(d) for n in ns)
             out.update(BY_FILE.get(f, ()))
             for imp in TEST_IMPORTERS.get(f, []):
                 out.update(BY_FILE.get(imp, ()))
@@ -1409,6 +1452,8 @@ def child_main(plan: Plan, wfd: int) -> None:
                 # from front-end fingerprints when nothing changed is used by
                 # their execution side (all queries are checked)
                 for n in SPLIT_NUMS:
+                    if getattr(plan, "import_errors", None):
+                        break  # the execution side may not import: run TPC tests for real
                     if n not in cands or n in plan.cands.other:
                         continue
                     if n in plan.cands and (plan.split.get(n) or (None,) * 5)[4] != "fe":
@@ -1421,6 +1466,8 @@ def child_main(plan: Plan, wfd: int) -> None:
                         continue
                     nq = sm["nq"]
                     split[n] = (sm["attr"], list(range(nq)), nq, round(0.3 + sum(fe["cpu"].values()), 3), "fe")
+            if getattr(plan, "import_errors", None):
+                split = {n: v for n, v in split.items() if v[4] != "fe"}
             verify, include = choose_verify(cands, True, split)
             vsplit = {n: v for n, v in split.items() if n in verify}
             vfe = {n: v for n, v in vsplit.items() if v[4] == "fe"}

@@ -148,7 +148,9 @@ def import_all(root_pkg: str = "sqlglot") -> tuple[list[str], dict[str, str]]:
     pkg = importlib.import_module(root_pkg)
     names = sorted(
         info.name
-        for info in pkgutil.walk_packages(pkg.__path__, prefix=root_pkg + ".")
+        # onerror: a package that raises anything (a SyntaxError below it, not
+        # just ImportError) is recorded by the import loop, not raised here
+        for info in pkgutil.walk_packages(pkg.__path__, prefix=root_pkg + ".", onerror=lambda _n: None)
         if info.name != root_pkg + ".__main__"
     )
     ok = [root_pkg]
