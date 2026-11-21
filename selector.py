@@ -1297,7 +1297,12 @@ class _Timeout(BaseException):
     pass
 
 
+TIMED_OUT = [False]  # once anything timed out, verify nothing more: include the rest
+SETUP_LIMIT = float(os.environ.get("BR_SETUP_LIMIT", "15"))  # class/module set-up and tear-down
+
+
 def _on_alarm(*_):
+    TIMED_OUT[0] = True
     raise _Timeout()
 
 
@@ -1375,7 +1380,8 @@ def run_tests(nums: list[int], split: dict | None = None) -> tuple[set, set]:
             signal.setitimer(signal.ITIMER_REAL, limits.get(test.id(), 5.0))
 
         def stopTest(self, test):
-            signal.setitimer(signal.ITIMER_REAL, 0)
+            # the next class's set-up (or this one's tear-down) runs before the next startTest
+            signal.setitimer(signal.ITIMER_REAL, SETUP_LIMIT)
             super().stopTest(test)
 
     signal.signal(signal.SIGALRM, _on_alarm)
@@ -1397,9 +1403,14 @@ def run_tests(nums: list[int], split: dict | None = None) -> tuple[set, set]:
         # attribute, so cut no TPC query list in that case)
         _apply_split(split, tpc=not any(n in SPLIT_NUMS and n not in split for n in nums))
     for items, suite in suites:
+        if TIMED_OUT[0]:  # something hangs: do not pay for it again
+            failing |= {n for n, _ in items}
+            continue
         res = R()
         try:
+            signal.setitimer(signal.ITIMER_REAL, SETUP_LIMIT)
             suite.run(res)
+            signal.setitimer(signal.ITIMER_REAL, 0)
         except BaseException:  # noqa: BLE001  (timeout in a fixture, SystemExit, ...)
             signal.setitimer(signal.ITIMER_REAL, 0)
             failing |= {n for n, _ in items}
@@ -1542,12 +1553,20 @@ def fe_check_queries(vfe: dict) -> tuple[set, dict]:
         import tpcfp
     except Exception:  # noqa: BLE001
         return set(vfe), runs
-    for n, (attr, idx, nq, _c, _m) in vfe.items():
+    signal.signal(signal.SIGALRM, _on_alarm)
+    for n, (attr, idx, nq, c, _m) in vfe.items():
         tid = SPLIT_NUMS[n]
         fe = fe_maps().get(tid) or {}
+        if TIMED_OUT[0]:
+            failing.add(n)
+            continue
         try:
+            # a front end that hangs counts as differing
+            signal.setitimer(signal.ITIMER_REAL, 5.0 + 4.0 * c)
             D = tpcfp.differing_upto(tid, idx, fe.get("arts", {}), FE_RUN_MAX)
+            signal.setitimer(signal.ITIMER_REAL, 0)
         except BaseException:  # noqa: BLE001
+            signal.setitimer(signal.ITIMER_REAL, 0)
             D = None
         if D == []:
             continue
@@ -1645,6 +1664,8 @@ def child_main(plan: Plan, wfd: int) -> None:
             result["verified"] = len(verify)
             if DEBUG:
                 result["vlist"] = sorted(verify)
+                if TIMED_OUT[0]:
+                    result["timed_out"] = True
             result["failing_verified"] = sorted(failing)
             result["cands"] = len(cands)
     except BaseException as e:  # noqa: BLE001
@@ -1670,7 +1691,10 @@ def child_main(plan: Plan, wfd: int) -> None:
 def main() -> None:
     commits = sorted(p[:-6] for p in os.listdir(os.path.join(DATA, "commits")) if p.endswith(".patch"))
     n = len(commits)
-    budget = float(os.environ.get("BR_BUDGET", 0)) or (150.0 if n <= 45 else 235.0) * max(1.0, n / (40 if n <= 45 else 60))
+    # wall-clock limits: 3 minutes for practice (40 commits), 4.5 for the final
+    # (about 60); only local benchmarks far larger than either scale them up
+    scale = max(1.0, n / (40 if n <= 45 else 60)) if n > 120 else 1.0
+    budget = float(os.environ.get("BR_BUDGET", 0)) or (150.0 if n <= 45 else 235.0) * scale
     plans: dict[str, Plan] = {}
     for cid in commits:
         with open(os.path.join(DATA, "commits", cid + ".patch"), encoding="utf-8", errors="surrogateescape", newline="") as fh:
@@ -1730,7 +1754,7 @@ def main() -> None:
         gc.freeze()  # children: no GC pass over the parent's objects (copy-on-write)
     queue = list(jobs)
     # hard wall-clock watchdog: the whole batch must finish inside the limit
-    hard = float(os.environ.get("BR_HARD", 0)) or (168.0 if n <= 45 else 258.0) * max(1.0, n / (40 if n <= 45 else 60))
+    hard = float(os.environ.get("BR_HARD", 0)) or (168.0 if n <= 45 else 258.0) * scale
     child_limit = float(os.environ.get("BR_CHILD_LIMIT", "45"))
     while queue or running:
         while queue and len(running) < max_par and time.time() - T0 < budget:
