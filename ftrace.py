@@ -89,6 +89,10 @@ def exec_lines(tid):
                 attrs.add(self.k)
                 t = typ if typ is not None else type(obj)
                 lk.add((keys.get(id(t)) or f"{getattr(t, '__module__', '?')}:{getattr(t, '__qualname__', '?')}") + "|" + self.k)
+                if id(t) not in keys:  # a class built at run time: also its sqlglot ancestors (tracer.py)
+                    for b in getattr(t, "__mro__", ())[1:]:
+                        if id(b) in keys:
+                            lk.add(keys[id(b)] + "|" + self.k)
             return self.v
 
     for _key, c in list(fingerprint.iter_classes(sorted(sys.modules), "sqlglot")):  # list first: see tracer.py

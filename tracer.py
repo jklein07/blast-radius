@@ -174,6 +174,19 @@ def _cls_key(c) -> str:
     return k
 
 
+def _lk_keys(c, a: str) -> list[str]:
+    """A read through a class the import-time walk never saw (defined in a
+    test, or built while one runs) also counts as a read through each of its
+    sqlglot ancestors: the selector only knows sqlglot's own class tree."""
+    out = [f"{_cls_key(c)}|{a}"]
+    if id(c) not in class_keys:
+        for b in getattr(c, "__mro__", ())[1:]:
+            kb = class_keys.get(id(b))
+            if kb is not None:
+                out.append(f"{kb}|{a}")
+    return out
+
+
 # ------------------------------------------------------------------ children
 mon = sys.monitoring
 TOOL = 3
@@ -255,7 +268,7 @@ def run_child(num: int) -> None:
         "cpu": round(cpu, 4),
         "wall": round(wall, 4),
         "lines": {fn[len(PREFIX):]: sorted(s) for fn, s in lines.items()},
-        "lk": sorted({f"{_cls_key(c)}|{a}" for c, a in _lk}),
+        "lk": sorted({k for c, a in _lk for k in _lk_keys(c, a)}),
         "reads": sorted(_reads),
         "spawned": spawned,
     }

@@ -727,6 +727,10 @@ def _cov_only(rel: str, lines) -> set:
     return out
 
 
+WM_FAMILY_EQ = ("Is", "IsNot", "Eq", "NotEq")  # as in wmtrace.py
+WM_FAMILY_ORD = ("Lt", "LtE", "Gt", "GtE", "Eq", "NotEq")
+
+
 def wm_tests(rel: str, key: str, old_op: str, new_op: str, lines) -> set | None:
     """Tests in which swapping this comparison's operator for new_op changes
     a result at least once (wmtrace.py). None: no profile for the site."""
@@ -735,6 +739,11 @@ def wm_tests(rel: str, key: str, old_op: str, new_op: str, lines) -> set | None:
         return None
     site = W["sites"].get(rel, {}).get(key)
     if site is None or site[0] != old_op:
+        return None
+    # wmtrace.py only evaluates alternatives within the operator's family; a
+    # swap to anything else (== -> <=, != -> in, ...) was never measured
+    fam = WM_FAMILY_ORD if old_op in ("Lt", "LtE", "Gt", "GtE") else WM_FAMILY_EQ
+    if old_op not in WM_FAMILY_ORD + WM_FAMILY_EQ or new_op not in fam or new_op == old_op:
         return None
     for d in W["modules"].values():  # the swap shows while a test module imports
         if new_op in d.get(rel, {}).get(key, ()):

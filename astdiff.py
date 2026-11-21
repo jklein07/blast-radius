@@ -125,7 +125,7 @@ class _Walker:
                         self.report(a, ctx, stmt, None)
                     else:
                         self.node(va, vb, ctx + (a,), stmt)
-                elif va != vb:
+                elif va != vb or type(va) is not type(vb):  # True == 1 == 1.0
                     self.report(a, ctx, stmt, None)
             return
         if a != b:
