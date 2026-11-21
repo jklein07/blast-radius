@@ -16,5 +16,5 @@ RUN cd /opt/sqlglot && SKIP_INTEGRATION=0 PYTHONHASHSEED=0 python /app/mksnap.py
  && python -m compileall -q -j 4 /opt/sqlglot /app /usr/local/lib/python3.13 >/dev/null 2>&1; \
     chmod -R a+rX /opt/sqlglot /app
 
-ENV SKIP_INTEGRATION=0 PYTHONHASHSEED=0
+ENV SKIP_INTEGRATION=0 PYTHONHASHSEED=0 BR_CALIB=alt
 CMD ["python", "/app/selector.py"]
