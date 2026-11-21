@@ -62,7 +62,12 @@ them across workers.
      never runs. Names pytest might collect (`test*`, `*_test`, `conftest`)
      never count.
 2. **Runtime changes → line coverage.** A difference inside a function or
-   lambda body only matters to tests that execute it. `tracer.py` ran every
+   lambda body only matters to tests that execute it. A lambda's body runs
+   in its own frame when the lambda is called, so a change inside it is
+   charged to the tests that ran the lambda's body lines, not every line of
+   the statement around it (one entry of a dict holding dozens of lambdas,
+   say). Code that reads a lambda's code object instead of calling it is
+   only `test_typing`, which also reads the source files it checks. `tracer.py` ran every
    test of the pinned commit in its own forked process with `sys.monitoring`
    and recorded the lines each one executed (process-pool work included; see
    `inline.py`).

@@ -233,7 +233,13 @@ class _Walker:
                     if hasattr(anc, "lineno") and not isinstance(anc, FUNC):
                         lines |= set(range(anc.lineno, (getattr(anc, "end_lineno", None) or anc.lineno) + 1))
                         break
-            if stmt is not None and hasattr(stmt, "lineno") and stmt is not fn:
+            if isinstance(fn, ast.Lambda):
+                # a lambda's body runs only when it is called, in its own
+                # frame; the statement around it (a dict of many lambdas, a
+                # call that takes one) runs its other lines without it
+                b = fn.body
+                lines |= set(range(b.lineno, (getattr(b, "end_lineno", None) or b.lineno) + 1))
+            elif stmt is not None and hasattr(stmt, "lineno") and stmt is not fn:
                 lines.add(stmt.lineno)
                 if isinstance(stmt, _COMPOUND):
                     # the whole header expression: `if (` alone fires no line event
