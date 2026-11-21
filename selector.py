@@ -745,6 +745,10 @@ def analyze(cid: str, text: str) -> Plan:
                 plan.all_tests = True
                 plan.notes.append(f"pytest config {r}")
         path = new_rel or old_rel
+        if any(test_side(r, fp.is_new) for r in rels) and astdiff.side_effects(old) != astdiff.side_effects(new):
+            # pytest imports it while collecting, before any test runs
+            plan.all_tests = True
+            plan.notes.append(f"test module side effect {path}")
         listing = fp.is_new or fp.is_deleted or (old_rel != new_rel)
         for r in rels:  # tests that open the file itself (source readers too)
             plan.cands.add(tests_reading(r, listing), P_CODE if r.endswith(".py") else P_DATA)
@@ -781,6 +785,17 @@ def analyze(cid: str, text: str) -> Plan:
     if plan.need_snapshot and any(r.startswith("sqlglot/") for r in plan.files):
         plan.cands.add(SPAWNERS, P_LOW)
     return plan
+
+
+def test_side(rel: str, is_new: bool) -> bool:
+    """A Python file under tests/ that pytest imports while collecting: a test
+    module, a package __init__, a module some test file imports, or a new
+    file (another changed file may import it)."""
+    if not (rel.startswith("tests/") and rel.endswith(".py")):
+        return False
+    b = os.path.basename(rel)
+    return (is_new or rel in BY_FILE or bool(TEST_IMPORTERS.get(rel)) or b == "__init__.py"
+            or b.startswith("test_") or b.endswith("_test.py"))
 
 
 def tests_reading(rel: str, listing: bool = False) -> set:

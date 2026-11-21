@@ -745,3 +745,127 @@ def analyze(old_src: str | None, new_src: str | None, old_changed=None, new_chan
     _Walker(c, (old_src or "").split("\n"), (new_src or "").split("\n"), old_src, new_src).seq(ba, bb, (a,), None, a)
     c.semantic = bool(c.runtime_lines or c.import_time or c.def_changes or c.import_lines)
     return c
+
+
+# ------------------------------------------- import-time side effects of tests
+# pytest imports every test module (and what they import) while it collects,
+# before any test runs, in every process that runs tests. So a test module
+# whose import changes shared state (patches a sqlglot class, edits a
+# registry, sets an environment variable ...) can break tests in any other
+# file. side_effects() lists the statements of a test-side module that run at
+# import and might do that: everything except imports, docstrings, plain
+# defs and test classes, and names bound to values computed without calls
+# (or with a few pure builtins). Comparing the lists of the old and new
+# versions tells whether a patch adds, removes or changes any of them.
+
+_SAFE_CALLS = {
+    "os.path.join", "os.path.dirname", "os.path.abspath", "os.path.realpath", "os.path.normpath",
+    "os.path.basename", "os.path.splitext", "os.path.isdir", "os.path.isfile", "os.path.exists",
+    "os.environ.get", "os.getenv", "re.compile", "frozenset", "set", "list", "dict", "tuple", "str",
+    "int", "float", "bool", "bytes", "len", "sorted", "reversed", "range", "enumerate", "zip", "min",
+    "max", "sum", "any", "all", "isinstance", "issubclass", "repr", "string_to_bool", "is_compiled",
+}
+_SAFE_DECOS = {
+    "classmethod", "staticmethod", "property",
+    "unittest.skip", "unittest.skipIf", "unittest.skipUnless", "unittest.expectedFailure",
+    "skip", "skipIf", "skipUnless", "expectedFailure",
+    "mock.patch", "mock.patch.object", "mock.patch.dict", "mock.patch.multiple",
+    "unittest.mock.patch", "unittest.mock.patch.object", "unittest.mock.patch.dict",
+    "unittest.mock.patch.multiple", "patch", "patch.object", "patch.dict", "patch.multiple",
+    "pytest.mark.skip", "pytest.mark.skipif",  # (not xfail or timeout: pytest's verdict would differ from a plain run)
+}
+_TEST_BASES = {"unittest.TestCase", "TestCase", "object"}
+
+
+def _dotted(n) -> str | None:
+    parts = []
+    while isinstance(n, ast.Attribute):
+        parts.append(n.attr)
+        n = n.value
+    if not isinstance(n, ast.Name):
+        return None
+    parts.append(n.id)
+    return ".".join(reversed(parts))
+
+
+def _pure(n) -> bool:
+    if n is None:
+        return True
+    for x in ast.walk(n):
+        if isinstance(x, (ast.Await, ast.Yield, ast.YieldFrom, ast.NamedExpr)):
+            return False
+        if isinstance(x, ast.Call) and _dotted(x.func) not in _SAFE_CALLS:
+            return False
+    return True
+
+
+def _deco_ok(d) -> bool:
+    if isinstance(d, ast.Call):
+        return _dotted(d.func) in _SAFE_DECOS and all(_pure(a) for a in d.args) and all(_pure(k.value) for k in d.keywords)
+    return _dotted(d) in _SAFE_DECOS
+
+
+def _names_only(t) -> bool:
+    if isinstance(t, ast.Name):
+        return True
+    if isinstance(t, ast.Starred):
+        return _names_only(t.value)
+    if isinstance(t, (ast.Tuple, ast.List)):
+        return all(_names_only(e) for e in t.elts)
+    return False
+
+
+def _main_guard(s) -> bool:
+    t = s.test
+    return (isinstance(t, ast.Compare) and isinstance(t.left, ast.Name) and t.left.id == "__name__"
+            and len(t.ops) == 1 and isinstance(t.ops[0], ast.Eq)
+            and isinstance(t.comparators[0], ast.Constant) and t.comparators[0].value == "__main__")
+
+
+def _se_body(body, ctx: str, ok_bases: set, out: set) -> None:
+    for s in body:
+        if isinstance(s, (ast.Import, ast.Pass)):
+            continue
+        if isinstance(s, ast.ImportFrom):
+            if s.level or (s.module or "").split(".")[0] == "tests":
+                ok_bases.update(a.asname or a.name for a in s.names)  # test helpers (Validator ...)
+            continue
+        if isinstance(s, ast.Expr) and isinstance(s.value, ast.Constant):
+            continue
+        if isinstance(s, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            a = s.args
+            hdr = [*a.defaults, *a.kw_defaults, s.returns,
+                   *[x.annotation for x in (*a.posonlyargs, *a.args, *a.kwonlyargs, a.vararg, a.kwarg) if x is not None]]
+            if not all(_deco_ok(d) for d in s.decorator_list) or not all(_pure(x) for x in hdr):
+                out.add(ctx + "def " + s.name + " " + _dump(ast.Tuple(elts=[*s.decorator_list, *[x for x in hdr if x is not None]], ctx=ast.Load())))
+            continue
+        if isinstance(s, ast.ClassDef):
+            if (all(_deco_ok(d) for d in s.decorator_list) and not s.keywords
+                    and all(_dotted(b) in _TEST_BASES or _dotted(b) in ok_bases for b in s.bases)):
+                ok_bases.add(s.name)
+            else:  # a metaclass (Dialect, Expression ...) may register it globally
+                out.add(ctx + "class " + s.name + " " + _dump(ast.Tuple(elts=[*s.decorator_list, *s.bases, *[k.value for k in s.keywords]], ctx=ast.Load())))
+            _se_body(s.body, ctx + s.name + ".", set(ok_bases), out)
+            continue
+        if isinstance(s, (ast.Assign, ast.AnnAssign)):
+            tg = s.targets if isinstance(s, ast.Assign) else [s.target]
+            if all(_names_only(t) for t in tg) and _pure(s.value) and (isinstance(s, ast.Assign) or _pure(s.annotation)):
+                continue
+        if isinstance(s, ast.If) and _main_guard(s):
+            continue
+        out.add(ctx + _dump(s))
+
+
+def side_effects(src: str | None) -> set:
+    """Signatures of the statements of a test-side module that run when it is
+    imported and may change state other tests share. A module that does not
+    parse never runs, so it has none."""
+    if src is None:
+        return set()
+    try:
+        tree = ast.parse(src)
+    except (SyntaxError, ValueError):
+        return set()
+    out: set = set()
+    _se_body(tree.body, "", set(), out)
+    return out

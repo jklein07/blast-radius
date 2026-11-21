@@ -70,7 +70,15 @@ them across workers.
 
 When anything is uncertain (unparseable patch, import failure, pytest
 configuration change, child error or time budget), it falls back to a safe
-superset.
+superset. One such case is a test-side module (a test file, a package
+`__init__`, a helper the tests import, or a new file) whose import-time
+statements change in a way that could touch shared state (patching a sqlglot
+class, defining a dialect subclass, setting an environment variable) or
+change pytest's verdict (an xfail or timeout mark). pytest imports every
+test module while collecting, in every worker, so shared state can break
+tests in any file. Imports, plain definitions,
+test classes, skip and `mock.patch` decorators and call-free constants are
+known not to.
 
 No answers are worked out ahead of time: there is no table from patches or
 kinds of edit to failing tests. The maps in `maps/` are built only from the
