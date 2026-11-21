@@ -998,6 +998,46 @@ def _cov_only(rel: str, lines) -> set:
     return out
 
 
+_BW = None
+
+
+def bw_maps() -> dict:
+    global _BW
+    if _BW is None:
+        try:
+            with gzip.open(os.path.join(os.path.dirname(MAPS), "bw.json.gz"), "rt") as fh:
+                _BW = json.load(fh)
+            nums = [NUM_BY_ID.get(i) for i in _BW["tests"]]
+            _BW["_nums"] = nums
+            _BW["_incomplete"] = {nums[i] for i in _BW["incomplete"] if nums[i] is not None}
+            _BW["_incomplete"] |= set(ALL) - {n for n in nums if n is not None}
+        except Exception:  # noqa: BLE001
+            _BW = {}
+    return _BW
+
+
+def bw_tests(rel: str, key: str, i: int, op: str, lines) -> set | None:
+    """Tests in which swapping the i-th operator of this and/or chain ever
+    changes its value (or what it evaluates), per bwtrace.py. None: no
+    profile for the chain."""
+    W = bw_maps()
+    if not W:
+        return None
+    site = W["sites"].get(rel, {}).get(key)
+    if site is None or site[0] != op or not 0 <= i < site[1] - 1:
+        return None
+    for d in W["modules"].values():  # the swap shows while a test module imports
+        if i in d.get(rel, {}).get(key, ()):
+            return None
+    out: set = set()
+    sid = site[3].get(str(i))
+    if sid is not None:
+        nums = W["_nums"]
+        out.update(nums[j] for j in W["sets"][sid] if nums[j] is not None)
+    out |= _cov_only(rel, lines) & W["_incomplete"]
+    return out
+
+
 WM_FAMILY_EQ = ("Is", "IsNot", "Eq", "NotEq")  # as in wmtrace.py
 WM_FAMILY_ORD = ("Lt", "LtE", "Gt", "GtE", "Eq", "NotEq")
 
@@ -1031,9 +1071,11 @@ def wm_tests(rel: str, key: str, old_op: str, new_op: str, lines) -> set | None:
 def runtime_tests(rel: str, ch: astdiff.PyChange, old_src) -> set:
     """Tests that execute a runtime difference. When no line of a difference
     can fire a line event (a bare `if (` line, `nonlocal`, ...), blame its
-    whole function instead. An operator swap counts only for the tests in
-    which the new operator would give a different result."""
+    whole function instead. An operator swap (a comparison's, or one `and`/`or`
+    of a chain) counts only for the tests in which it would give a different
+    result."""
     swaps = getattr(ch, "swaps", None) or []
+    bswaps = getattr(ch, "bswaps", None) or []
     swap_groups = set()
     out: set = set()
     for key, old_op, new_op, lines, gi in swaps:
@@ -1043,7 +1085,14 @@ def runtime_tests(rel: str, ch: astdiff.PyChange, old_src) -> set:
         else:
             out |= t
             swap_groups.add(gi)
-    out |= cov_tests(rel, ch.plain_lines if swaps else ch.runtime_lines)
+    for key, i, op, lines, gi in bswaps:
+        t = bw_tests(rel, key, i, op, lines)
+        if t is None:
+            out |= cov_tests(rel, lines)
+        else:
+            out |= t
+            swap_groups.add(gi)
+    out |= cov_tests(rel, ch.plain_lines if swaps or bswaps else ch.runtime_lines)
     fm = COV.get(rel) or {}
     for gi, (lines, first, last) in enumerate(ch.runtime_groups):
         if gi in swap_groups:

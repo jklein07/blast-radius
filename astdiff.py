@@ -15,6 +15,7 @@ Comment-only and formatting-only edits produce no differences at all.
 from __future__ import annotations
 
 import ast
+import copy
 import difflib
 from dataclasses import dataclass, field
 
@@ -39,6 +40,9 @@ class PyChange:
     # runtime differences that only swap the operator of a one-operator
     # comparison: (site "line:col:end_line:end_col", old op, new op, old lines, index in runtime_groups)
     swaps: list = field(default_factory=list)
+    # runtime differences that only swap one `and`/`or` of a chain:
+    # (chain site "line:col:end_line:end_col", operator index, "And"/"Or", old lines, index in runtime_groups)
+    bswaps: list = field(default_factory=list)
     plain_lines: set = field(default_factory=set)  # runtime_lines from every other kind of difference
     # module-level names renamed everywhere in the file, (old, new); the
     # caller must check that no other file mentions either
@@ -75,6 +79,68 @@ def _span(x):
     return first, (getattr(x, "end_lineno", None) or x.lineno)
 
 
+class _FlatBool(ast.NodeTransformer):
+    """Nested chains of the same operator read as one: `a and (b and c)`
+    evaluates exactly like `a and b and c` (same operands, same order, same
+    value)."""
+
+    def visit_BoolOp(self, node):
+        self.generic_visit(node)
+        vals = []
+        for v in node.values:
+            if isinstance(v, ast.BoolOp) and type(v.op) is type(node.op):
+                vals.extend(v.values)
+            else:
+                vals.append(v)
+        node.values = vals
+        return node
+
+
+def _flat_dump(e) -> str:
+    return _dump(_FlatBool().visit(copy.deepcopy(e)))
+
+
+def _flipped(n: ast.BoolOp, i: int) -> ast.expr:
+    """Chain n with its i-th operator swapped, as Python parses that source:
+    `and` binds tighter than `or`."""
+    vals = n.values
+    if isinstance(n.op, ast.And):
+        left, right = vals[: i + 1], vals[i + 1 :]
+        lft = left[0] if len(left) == 1 else ast.BoolOp(op=ast.And(), values=left)
+        rgt = right[0] if len(right) == 1 else ast.BoolOp(op=ast.And(), values=right)
+        return ast.BoolOp(op=ast.Or(), values=[lft, rgt])
+    rest = vals[:i] + [ast.BoolOp(op=ast.And(), values=[vals[i], vals[i + 1]])] + vals[i + 2 :]
+    return rest[0] if len(rest) == 1 else ast.BoolOp(op=ast.Or(), values=rest)
+
+
+def _bool_flip(a: ast.BoolOp, b: ast.BoolOp):
+    """(chain, i) when b is a with only the i-th `and`/`or` of one chain
+    inside a swapped (compared with same-operator chains flattened), else None."""
+    target = _flat_dump(b)
+    for n in ast.walk(a):
+        if not isinstance(n, ast.BoolOp) or not hasattr(n, "end_col_offset"):
+            continue
+        for i in range(len(n.values) - 1):
+            memo: dict = {}
+            root = copy.deepcopy(a, memo)
+            nc = memo[id(n)]
+            new = _flipped(nc, i)
+            if root is nc:
+                root = new
+            else:
+                for p in ast.walk(root):
+                    for f, v in ast.iter_fields(p):
+                        if v is nc:
+                            setattr(p, f, new)
+                        elif isinstance(v, list):
+                            for j, x in enumerate(v):
+                                if x is nc:
+                                    v[j] = new
+            if _flat_dump(root) == target:
+                return n, i
+    return None
+
+
 class _Walker:
     def __init__(self, change: PyChange, old_lines=None, new_lines=None, old_src=None, new_src=None, alpha: bool = True):
         self.c = change
@@ -82,6 +148,7 @@ class _Walker:
         self.ol = old_lines
         self.nl = new_lines
         self._swap = None
+        self._bswap = None
         self._src = (old_src, new_src)
         self._code: list = [None, None]
 
@@ -129,6 +196,17 @@ class _Walker:
                 return
             if isinstance(a, ast.stmt):
                 stmt = a
+            if isinstance(a, ast.BoolOp) and isinstance(b, ast.BoolOp) and self._swap is None and self._bswap is None:
+                fl = _bool_flip(a, b)
+                if fl is not None:
+                    chain, i = fl
+                    key = f"{chain.lineno}:{chain.col_offset}:{chain.end_lineno}:{chain.end_col_offset}"
+                    self._bswap = (key, i, type(chain.op).__name__)
+                    try:
+                        self.report(a, ctx, stmt, None)
+                    finally:
+                        self._bswap = None
+                    return
             if isinstance(a, FUNC):
                 # header vs body
                 hdr_a = [getattr(a, f, None) for f in ("args", "decorator_list", "returns", "name", "type_params")]
@@ -263,6 +341,9 @@ class _Walker:
             if self._swap is not None and not insertion and fn_first not in (-l for l in lines):
                 key, old_op, new_op = self._swap
                 self.c.swaps.append((key, old_op, new_op, frozenset(lines), len(self.c.runtime_groups)))
+            elif self._bswap is not None and not insertion and fn_first not in (-l for l in lines):
+                key, i, op = self._bswap
+                self.c.bswaps.append((key, i, op, frozenset(lines), len(self.c.runtime_groups)))
             else:
                 self.c.plain_lines |= lines
             self.c.runtime_groups.append((frozenset(lines), fn_first, fn_last))

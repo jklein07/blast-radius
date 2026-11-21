@@ -111,6 +111,22 @@ them across workers.
    charged only to those tests. Line coverage still applies to tests whose
    instrumented run cannot be trusted, and to sites the profile does not
    cover. The profile is the union of a native run and an amd64 run.
+   Swapping one `and` for `or` (or back) in a chain gets the same
+   treatment from `bwtrace.py`. It rewrites every `and`/`or` chain inside a
+   function into a call that evaluates the operands exactly as Python does,
+   then works out what each single swap would have done with the same
+   values: `a and b and c` with its second `and` swapped reads
+   `(a and b) or c`. The swapped chain may need an operand the original
+   skipped. The tracer evaluates it only through a guarded copy that refuses
+   anything that could change state: calls other than a few builtins,
+   `dict.get`, `str` methods and `Expression.text`, arithmetic on anything but
+   builtin numbers, a property whose getter stores something, a cached
+   property, a module's `__getattr__`. An operand the original evaluated but
+   the swap would skip must pass the same guard. Where only the chain's truth
+   is used (an `if` or `while` test, `not`, `bool()`, `assert`), equal truth
+   is enough; elsewhere the swapped value must be the very same object.
+   Anything it cannot decide counts as a difference, and a swap is charged
+   only to the tests in which it ever made one.
 5. **Query-level verification for the TPC tests.** `test_execute_tpcds`
    and its TPC-H siblings loop over a fixture's queries. `qtrace.py` records
    which queries execute each line. When a change reaches only some of them,
@@ -172,6 +188,7 @@ references).
 | `inline.py` | In-process ProcessPoolExecutor with pickle round trips |
 | `tracer.py`, `modlines.py`, `build_maps.py`, `mksnap.py` | Build-time tools that produce `maps/maps.json.gz` and `snap.json` from the pinned commit |
 | `wmtrace.py`, `build_wm.py` | Build-time: comparison-swap profile, `maps/wm.json.gz` |
+| `bwtrace.py`, `build_bw.py` | Build-time: and/or-swap profile, `maps/bw.json.gz` |
 | `qtrace.py`, `build_split.py` | Build-time: per-query coverage of the TPC tests, `maps/split.json.gz` |
 | `cftrace.py`, `build_cf.py`, `cfsel.py` | Per-pair coverage of the fixture-driven optimizer tests, `maps/cf.json.gz`; `cfsel.py` runs such a test on chosen pairs |
 
@@ -185,6 +202,8 @@ python modlines.py /opt/sqlglot tests.json out/modlines.json
 CALIB_DIR=out/calib python build_maps.py /opt/sqlglot tests.json out/trace out/modlines.json maps/maps.json.gz
 PYTHONHASHSEED=0 python wmtrace.py /opt/sqlglot tests.json out/wm 8
 python build_wm.py tests.json out/wm out/calib maps/wm.json.gz
+PYTHONHASHSEED=0 python bwtrace.py /opt/sqlglot tests.json out/bw 8
+python build_bw.py tests.json out/bw out/calib maps/bw.json.gz
 PYTHONHASHSEED=0 python qtrace.py /opt/sqlglot out/qtrace.json 4
 python build_split.py out/qtrace.json maps/split.json.gz
 PYTHONHASHSEED=0 python cftrace.py /opt/sqlglot out/cftrace 10
