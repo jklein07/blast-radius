@@ -64,6 +64,15 @@ them across workers.
      back to `function_fallback_sql`) had its class's `arg_types` read. So
      such a method charges only the tests that read something through class
      `X` and used that generator family.
+   - *Class annotations.* Adding, removing or retyping an annotated class
+     attribute (`FLAG: bool = False`) also changes the class's
+     `__annotations__`. Nothing in sqlglot or its tests reads a class's
+     annotations at run time (no `get_type_hints`, `inspect.get_annotations`
+     or dataclass on such classes), and what class creation derives from them
+     is fingerprinted on its own, so on a class whose whole MRO is sqlglot
+     code (no Enum, dataclass, NamedTuple, TypedDict or Protocol) that entry
+     charges nothing. The attribute's own value is a changed attribute like
+     any other.
    - *New modules nothing imports.* Python imports a module only by its name,
      and every dynamic import in sqlglot and its tests builds that name from
      text found somewhere (a dialect string, an attribute name, a fixed

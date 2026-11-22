@@ -1385,6 +1385,12 @@ def snapshot_candidates(pristine: dict, patched: dict, diff: dict, plan: Plan) -
     for key, attr in diff["attrs"]:
         if attr == "__doc__":
             continue  # docstrings: nothing reads them at runtime
+        if attr == "__annotations__" and _plain_class(key, pristine) is not None:
+            # class annotations (an annotated class attribute added, removed or
+            # retyped): no sqlglot module or test reads __annotations__ (no
+            # get_type_hints, inspect.get_annotations or dataclass on such a
+            # class), and the attribute's own value is a changed attr of its own
+            continue
         if dd:
             if live is None:
                 import fingerprint
@@ -2075,6 +2081,36 @@ def _member_class(key: str, attr: str, pristine: dict):
         return None
     pc = (pristine.get("classes") or {}).get(key)
     if pc is None or attr in pc:
+        return None
+    if not _LIVE:
+        import fingerprint
+
+        _LIVE.update(dict(fingerprint.iter_classes(sorted(sys.modules), "sqlglot")))
+    cls = _LIVE.get(key)
+    if not isinstance(cls, type):
+        return None
+    import dataclasses
+    import typing
+
+    if dataclasses.is_dataclass(cls):
+        return None
+    meta = type(cls)
+    if meta is not type and not (getattr(meta, "__module__", "") or "").startswith("sqlglot"):
+        return None
+    for k in cls.__mro__:
+        if k is object or k is typing.Generic:
+            continue
+        if not (getattr(k, "__module__", "") or "").startswith("sqlglot"):
+            return None
+    return cls
+
+
+def _plain_class(key: str, pristine: dict):
+    """The live class key when its MRO is all sqlglot code (no Enum,
+    dataclass, NamedTuple, TypedDict or Protocol, no foreign metaclass) and it
+    was no dataclass at the pinned commit either; else None."""
+    pc = (pristine.get("classes") or {}).get(key)
+    if pc is None or "__dataclass_fields__" in pc:
         return None
     if not _LIVE:
         import fingerprint
