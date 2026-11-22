@@ -1723,6 +1723,7 @@ def snapshot_candidates(pristine: dict, patched: dict, diff: dict, plan: Plan) -
                 sid = CLASSUSE.get(x)
                 if sid is not None:
                     out.update(SETS[sid])
+            out |= mro_moved_tests(key, sub, pristine, patched)
             continue
         base = attr_reader_tests(key, attr, sub, pristine, patched)
         if live is None:
@@ -2336,6 +2337,92 @@ def attr_reader_tests(key: str, attr: str, sub, pristine: dict, patched: dict) -
         # enum members, descriptors): every user of the class family
         out |= family_tests(key, sub)
     return out
+
+
+_DEF_TESTS: dict = {}
+_USED_BY: dict = {}
+
+
+def _def_tests(k: str, a: str) -> set:
+    """Tests that ran the function a defined in class k's own body."""
+    r = _DEF_TESTS.get((k, a))
+    if r is None:
+        r = _DEF_TESTS[(k, a)] = _def_tests_raw(k, a)
+    return r
+
+
+def _def_tests_raw(k: str, a: str) -> set:
+    mod, _, qual = k.partition(":")
+    rel = mod.replace(".", "/") + ".py"
+    if rel not in COV:
+        rel = mod.replace(".", "/") + "/__init__.py"
+    spans = M["defs"].get(rel, {}).get(f"{qual}.{a}")
+    return func_span_tests(rel, spans[0], spans[1]) if spans else set()
+
+
+def mro_moved_tests(key: str, sub, pristine: dict, patched: dict) -> set:
+    """A class kept on both sides with a different MRO (bases reordered,
+    added or removed). For each name, the chain of classes defining it in
+    the MRO decides what a lookup on the class's instances reaches first and
+    where super() calls inside each definition go next. Where that chain
+    moved, the tests that ran a definition which lost its place as the first
+    or whose successor changed (whatever they ran it on: a superset of the
+    runs on this class). When the abstract methods left over change, every
+    instantiation: the tests that ran the __init__/__new__ it reached, and
+    every reference to the class. Readers of data attributes through the
+    class family are its CLASSUSE sets, charged by the caller. A run only
+    matters on an object of this class family, so all of it is limited to
+    the tests that used the family: its readers, the tests that ran a line
+    naming one of its classes (every construction by name), and those that
+    ran one of its own methods."""
+    pc, nc = pristine["classes"], patched["classes"]
+    if key not in pc or key not in nc:
+        return set()
+    mo = [key] + pristine["bases"].get(key, [])
+    mn = [key] + patched["bases"].get(key, [])
+    out: set = set()
+    names: set = set()
+    for k in mo:
+        names |= set(pc.get(k, ()))
+    for k in mn:
+        names |= set(nc.get(k, ()))
+    for a in sorted(names):
+        co = [k for k in mo if a in pc.get(k, ())]
+        cn = [k for k in mn if a in nc.get(k, ())]
+        if co == cn:
+            continue
+        for i, k in enumerate(co):
+            nxt_o = co[i + 1] if i + 1 < len(co) else None
+            j = cn.index(k) if k in cn else None
+            nxt_n = cn[j + 1] if j is not None and j + 1 < len(cn) else None
+            if (i == 0 and j != 0) or nxt_o != nxt_n:
+                out |= _def_tests(k, a)
+    if pc[key].get("__abstractmethods__") != nc[key].get("__abstractmethods__"):
+        for a in ("__init__", "__new__"):
+            co = [k for k in mo if a in pc.get(k, ())]
+            if co:
+                out |= _def_tests(co[0], a)
+        mod, _, qual = key.partition(":")
+        out |= global_ref_tests(mod, qual.split(".")[0])
+    if not out:
+        return out
+    used: set = set()
+    for x in sub:
+        u = _USED_BY.get(x)
+        if u is None:
+            u = set()
+            sid = CLASSUSE.get(x)
+            if sid is not None:
+                u.update(SETS[sid])
+            mod, _, qual = x.partition(":")
+            if "." not in qual and mod.startswith("sqlglot"):
+                u |= global_ref_tests(mod, qual)
+            for a in pc.get(x, nc.get(x, ())):
+                u |= _def_tests(x, a)
+            if x in pc:  # pristine classes only: a patched class's members vary by commit
+                _USED_BY[x] = u
+        used |= u
+    return out & used
 
 
 def fresh_member(key: str, attr: str, plan: Plan, pristine: dict) -> bool:

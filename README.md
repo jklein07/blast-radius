@@ -115,8 +115,18 @@ them across workers.
    starting with `PARTITION BY` is scanned, twelve levels down the
    tokenizer's keyword trie. Each changed `(class, attribute)` maps to the
    tests that read that attribute through the class or a subclass. The tracer records those
-   reads by wrapping every class attribute in a recording descriptor. Each
-   changed global maps to the tests that execute a line referring to it.
+   reads by wrapping every class attribute in a recording descriptor. A class
+   whose bases change (reordered, added or removed) keeps its own attributes
+   but resolves names through a different MRO. For each name, the order of
+   the classes that define it decides what a lookup on the class reaches
+   first, and where `super()` inside each definition goes next. Where that
+   order moved, the definitions that lost first place, or whose next
+   definition changed, charge the tests that ran them. If the class's
+   leftover abstract methods change (an abstract `Schema` method now shadows
+   `MappingSchema`'s inherited implementation, so it can no longer be
+   instantiated), every test that ran the `__init__` it reached, or refers
+   to the class, is charged too. Each changed global maps to the tests that
+   execute a line referring to it.
    One registry gets a closer look: a new expression class adds a key to
    `exp.EXPR_CLASSES`, which every test that builds a generator reads (in
    `_build_dispatch`). When the only change to it is new keys for new
