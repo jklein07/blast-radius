@@ -1313,6 +1313,14 @@ def _changed_test_classes(old: str, new: str):
                     isinstance(n, ast.Name) and n.id in out for base in v.bases for n in ast.walk(base)):
                 out.add(v.name)
                 grew = True
+    import re
+
+    pat = re.compile(r"(?<![A-Za-z0-9_])(" + "|".join(re.escape(n) for n in sorted(out)) + r")(?![A-Za-z0-9_])")
+    for v in b.body:
+        if isinstance(v, ast.ClassDef) and v.name in out:
+            continue
+        if pat.search(ast.unparse(v)):
+            return None  # other module code uses one of them (an alias, a helper, a copy)
     return out
 
 
