@@ -233,7 +233,15 @@ them across workers.
    others, so a patch that takes a `sorted(` or `.sort(` out of sqlglot code
    (output may then follow set order), or adds a set (a display, a
    comprehension, `set(` or `frozenset(`), a `hash(` or `id(` call or a use of
-   `random` to sqlglot or test code, keeps its candidates unverified. Every
+   `random` to sqlglot or test code, keeps its candidates unverified. Counts
+   alone can cancel (a set comprehension turned into a list next to a new
+   `set(...)` loop), so the check also compares the set expressions inside
+   functions whose order can matter, old file against new: any new or
+   changed one counts,
+   including set methods (`.union()`, `.difference()`, ...) and set
+   operators on `keys()`/`items()` views, but not the right side of an `in`
+   test, where only membership matters. A new file is checked the same way.
+   None of the m1, sample or edge commits changes under this. Every
    verified test runs under its own timer (three times its measured cost plus a
    margin; 15 s for class setup); a test that runs out of time is kept,
    because a patch that makes a test hang makes it fail. A test stops at
@@ -299,6 +307,25 @@ charges that test, not `test_max_nodes` and the other 79.
 Files that import only other names from it are left out: every dialect test
 file imports just `Validator` from `tests/dialects/test_dialect.py`, so a
 method added to `TestDialect` does not reach them.
+
+Edited test code can also leak. A test that sets
+`BigQuery.NORMALIZATION_STRATEGY` and restores it in a `finally` block passes
+even when the restored value is wrong, but every later test in the same
+worker process that builds a BigQuery dialect then sees the leaked value. So
+when the edited code (old or new version) writes state outside itself, every
+test that reads that state is charged, and those tests are never verified,
+because a test run on its own cannot show the leak. Such writes are
+assignments, deletes, mutating calls (`.pop()`, `.update()`, ...),
+`setattr` and `delattr` through a module-level or imported name. Readers of
+a class attribute come from the lookup trace, readers of a module global
+from the lines naming it, and a test module's own state is charged as that
+file and its importers. Anything the trace cannot follow (another library's
+state, a method replaced by assignment) charges every test. A call of a
+module's own function that happens to have a mutator's name is not a write:
+`exp.update("tbl", ...)` in `tests/test_build.py` builds an UPDATE statement.
+(Whether a name is a module is read from the pristine files and their
+imports, matched case-exactly so a macOS checkout agrees with Linux.)
+Fifteen functions in the test suite write such state.
 
 The main process guards itself the same way. A patch that keeps the analysis
 of one commit busy for 20 s gets every test for that commit. If anything in

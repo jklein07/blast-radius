@@ -927,8 +927,8 @@ def analyze(cid: str, text: str) -> Plan:
             # decides: a child verifies under one seed, pytest under others
             plan.no_verify = True
             plan.notes.append(f"sort removed in {new_rel}: no verification")
-        if (old is not None and new is not None and (new_rel or "").startswith(("sqlglot/", "tests/")) and new_rel.endswith(".py")
-                and not plan.no_verify and _seed_order_added(old, new, fp)):
+        if ((old is not None or fp.is_new) and new is not None and (new_rel or "").startswith(("sqlglot/", "tests/"))
+                and new_rel.endswith(".py") and not plan.no_verify and _seed_order_added(old, new, fp)):
             # a new set (or hash(), id(), random): its order or value may
             # differ between our seed and pytest's
             plan.no_verify = True
@@ -1010,18 +1010,49 @@ def test_side(rel: str, is_new: bool) -> bool:
 _SEED_PRE = None
 
 
+_SET_METHODS = ("union", "intersection", "difference", "symmetric_difference")
+
+
 def _seed_nodes(src: str):
+    """(count, shapes): how many seed-sensitive nodes the module has (set
+    displays and comprehensions, set()/frozenset()/hash()/id() calls, uses
+    of random), and a multiset of the ones inside functions whose order or
+    value can matter, as ast.dump text: also set methods (a.union(b)) and
+    set operators on keys()/items() views, but not the right side of an
+    `in` test, where only membership counts."""
     import ast
+    from collections import Counter
+
+    def hit(x):
+        if isinstance(x, (ast.Set, ast.SetComp)):
+            return True
+        if isinstance(x, ast.Call) and isinstance(x.func, ast.Name) and x.func.id in ("set", "frozenset", "hash", "id"):
+            return True
+        return isinstance(x, ast.Attribute) and isinstance(x.value, ast.Name) and x.value.id == "random"
+
+    def setop(x):
+        if isinstance(x, ast.Call) and isinstance(x.func, ast.Attribute) and x.func.attr in _SET_METHODS:
+            return True
+        return (isinstance(x, ast.BinOp) and isinstance(x.op, (ast.Sub, ast.BitAnd, ast.BitOr, ast.BitXor))
+                and any(isinstance(v, ast.Call) and isinstance(v.func, ast.Attribute) and v.func.attr in ("keys", "items")
+                        for v in (x.left, x.right)))
 
     n = 0
-    for x in ast.walk(ast.parse(src)):
-        if isinstance(x, (ast.Set, ast.SetComp)):
-            n += 1
-        elif isinstance(x, ast.Call) and isinstance(x.func, ast.Name) and x.func.id in ("set", "frozenset", "hash", "id"):
-            n += 1
-        elif isinstance(x, ast.Attribute) and isinstance(x.value, ast.Name) and x.value.id == "random":
-            n += 1
-    return n
+    memb = set()
+    shapes: Counter = Counter()
+    fn = (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)
+    stack = [(ast.parse(src), False)]
+    while stack:  # one pass; a Compare comes off the stack before its operands
+        x, inf = stack.pop()
+        h = hit(x)
+        n += h
+        if isinstance(x, ast.Compare) and all(isinstance(o, (ast.In, ast.NotIn)) for o in x.ops):
+            memb.update(id(c) for c in x.comparators)
+        if inf and (h or setop(x)) and id(x) not in memb:
+            shapes[ast.dump(x)] += 1
+        inf = inf or isinstance(x, fn)
+        stack.extend((c, inf) for c in ast.iter_child_nodes(x))
+    return n, shapes
 
 
 def _seed_order_added(old: str, new: str, fp) -> bool:
@@ -1029,18 +1060,24 @@ def _seed_order_added(old: str, new: str, fp) -> bool:
     frozenset()), a hash() or id() call, or a use of random: iteration order
     of a set of strings, and hash() itself, follow PYTHONHASHSEED, so a child
     that verifies under seed 0 could pass a test that pytest fails. A quick
-    text check of the added lines first; then node counts, old against new."""
+    text check of the added lines first; then node counts, old against new,
+    and, so that a set removed elsewhere cannot hide one added, any new or
+    changed order-sensitive set inside a function (old is None for a new
+    file)."""
     import re
 
     global _SEED_PRE
     if _SEED_PRE is None:
-        _SEED_PRE = re.compile(r"(?<![\w.])(?:set|frozenset|hash|id)\s*\(|\brandom\b|\{|\bcomprehension\b")
+        _SEED_PRE = re.compile(r"(?<![\w.])(?:set|frozenset|hash|id)\s*\(|\brandom\b|\{|\bcomprehension\b"
+                               r"|\.(?:union|intersection|difference|symmetric_difference|keys|items)\s*\(")
     if not any(_SEED_PRE.search(l) for l in fp.added_text()):
         return False
     try:
-        return _seed_nodes(new) > _seed_nodes(old)
+        nn, ns = _seed_nodes(new)
+        on, os_ = _seed_nodes(old) if old is not None else (0, {})
     except (SyntaxError, ValueError, RecursionError):
         return False
+    return nn > on or bool(ns - os_) if old is not None else bool(ns)
 
 
 def tests_reading(rel: str, listing: bool = False) -> set:
@@ -1267,6 +1304,300 @@ def sqlglot_change(plan: Plan, rel: str, ch: astdiff.PyChange, old_src=None) -> 
         plan.need_snapshot = True
 
 
+_MUTATORS = {"append", "extend", "insert", "pop", "popitem", "remove", "clear", "update", "setdefault",
+             "add", "discard", "sort", "reverse", "__setitem__", "__delitem__", "__setattr__", "__delattr__"}
+
+
+def _module_names(tree) -> dict:
+    """Module-level names of a test module: name -> (module, imported name or
+    None for a module), or None when the module itself binds it."""
+    import ast
+
+    out: dict = {}
+    for n in tree.body:
+        if isinstance(n, ast.Import):
+            for a in n.names:
+                out[a.asname or a.name.split(".")[0]] = (a.name if a.asname else a.name.split(".")[0], None)
+        elif isinstance(n, ast.ImportFrom) and n.module and not n.level:
+            for a in n.names:
+                out[a.asname or a.name] = (n.module, a.name)
+        elif isinstance(n, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
+            out[n.name] = None
+        elif isinstance(n, (ast.Assign, ast.AnnAssign, ast.AugAssign)):
+            for t in n.targets if isinstance(n, ast.Assign) else [n.target]:
+                for x in ast.walk(t):
+                    if isinstance(x, ast.Name):
+                        out.setdefault(x.id, None)
+    return out
+
+
+_ISMOD: dict = {}
+
+
+def _is_module(mod: str, name) -> bool:
+    """Whether mod.name (mod itself when name is None) is a module of the
+    pristine tree: a file or package there, or a name mod binds at its top
+    level by importing one (sqlglot.exp is sqlglot.expressions)."""
+    import ast
+
+    if name is None:
+        return True
+    key = (mod, name)
+    if key in _ISMOD:
+        return _ISMOD[key]
+    _ISMOD[key] = False  # import cycles
+    base = os.path.join(PRISTINE, *mod.split("."))
+    try:
+        ls = set(os.listdir(base)) if os.path.isdir(base) else set()
+    except OSError:
+        ls = set()
+    # names compared exactly (a case-insensitive file system would match a class to its module)
+    r = name + ".py" in ls or (name in ls and os.path.isfile(os.path.join(base, name, "__init__.py")))
+    if not r:
+        pkg = os.path.isfile(os.path.join(base, "__init__.py"))
+        src = read_pristine(os.path.relpath(os.path.join(base, "__init__.py") if pkg else base + ".py", PRISTINE))
+        try:
+            body = ast.parse(src).body if src else []
+        except (SyntaxError, ValueError, RecursionError):
+            body = []
+        for n in body:
+            if isinstance(n, ast.Import):
+                r = r or any((a.asname or a.name.split(".")[0]) == name for a in n.names)
+            elif isinstance(n, ast.ImportFrom):
+                if n.level:
+                    parts = mod.split(".") if pkg else mod.split(".")[:-1]
+                    parts = parts[:len(parts) - (n.level - 1)] if n.level > 1 else parts
+                    src_mod = ".".join(parts + ([n.module] if n.module else []))
+                else:
+                    src_mod = n.module
+                for a in n.names:
+                    if (a.asname or a.name) == name and src_mod:
+                        r = r or _is_module(src_mod, a.name)
+    _ISMOD[key] = r
+    return r
+
+
+def _module_object(e, modnames: dict, local: set) -> bool:
+    """Whether e (Name or Attribute chain) names a module, as in exp.update(...)
+    or sqlglot.expressions.update(...): a call of a module's function, not a
+    mutation of a container."""
+    import ast
+
+    attrs = []
+    while isinstance(e, ast.Attribute):
+        attrs.append(e.attr)
+        e = e.value
+    if not isinstance(e, ast.Name) or e.id in local:
+        return False
+    v = modnames.get(e.id)
+    if not v:
+        return False
+    mod, name = v
+    for a in [name] + attrs[::-1] if name is not None else attrs[::-1]:
+        if not _is_module(mod, a):
+            return False
+        mod = f"{mod}.{a}"
+    return True
+
+
+def _state_writes(node, modnames: dict) -> set:
+    """What node (a function or a module/class-level statement of a test
+    module) writes outside itself: (root, attribute chain) for assignments,
+    deletes, mutating calls, setattr and delattr through a module-level name
+    (or cls); ("<global>", name) for a global it rebinds."""
+    import ast
+
+    local: set = set()
+    glob: set = set()
+    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+        a = node.args
+        local |= {x.arg for x in a.posonlyargs + a.args + a.kwonlyargs}
+        local |= {x.arg for x in (a.vararg, a.kwarg) if x is not None}
+        glob = {g for x in ast.walk(node) if isinstance(x, (ast.Global, ast.Nonlocal)) for g in x.names}
+        for x in ast.walk(node):
+            if isinstance(x, ast.Name) and isinstance(x.ctx, ast.Store):
+                local.add(x.id)
+            elif isinstance(x, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and x is not node:
+                local.add(x.name)
+        # (names a local import binds stay shared: they are the modules and
+        # classes themselves, and leak_tests maps them like module-level imports)
+        local -= glob
+    out: set = set()
+
+    def chain_of(e):
+        attrs = []
+        while True:
+            if isinstance(e, ast.Attribute):
+                attrs.append(e.attr)
+                e = e.value
+            elif isinstance(e, ast.Subscript):
+                e = e.value
+            elif isinstance(e, ast.Call):
+                e = e.func
+            else:
+                break
+        return (e.id if isinstance(e, ast.Name) else None), tuple(reversed(attrs))
+
+    def note(e, extra=(), container=False):
+        r, attrs = chain_of(e)
+        attrs = attrs + tuple(extra)
+        if r is None:
+            return
+        if r in local and r != "cls" or (r != "cls" and r not in modnames and r not in glob):
+            # through a local object: a container reached by attribute may be a
+            # class attribute shared by every instance (parser.FUNCTIONS[k] = v)
+            if container and attrs and attrs[-1] in LK_BY_ATTR:
+                out.add(("<any>", attrs[-1:]))
+            return
+        out.add((r, attrs))
+
+    def targets(t):
+        if isinstance(t, (ast.Tuple, ast.List)):
+            for e in t.elts:
+                yield from targets(e)
+        elif isinstance(t, ast.Starred):
+            yield from targets(t.value)
+        else:
+            yield t
+
+    for x in ast.walk(node):
+        ts = []
+        if isinstance(x, (ast.Assign, ast.Delete)):
+            ts = x.targets
+        elif isinstance(x, (ast.AugAssign, ast.AnnAssign)):
+            ts = [x.target]
+        for t in ts:
+            for e in targets(t):
+                if isinstance(e, (ast.Attribute, ast.Subscript)):
+                    note(e, container=isinstance(e, ast.Subscript))
+                elif isinstance(e, ast.Name) and e.id in glob:
+                    out.add(("<global>", (e.id,)))
+        if isinstance(x, ast.Call):
+            f = x.func
+            if isinstance(f, ast.Attribute) and f.attr in _MUTATORS and not _module_object(f.value, modnames, local - glob):
+                note(f.value, container=True)
+            elif isinstance(f, ast.Name) and f.id in ("setattr", "delattr") and x.args:
+                a1 = x.args[1] if len(x.args) > 1 else None
+                name = a1.value if isinstance(a1, ast.Constant) and isinstance(a1.value, str) else "*"
+                note(x.args[0], (name,))
+    return out
+
+
+def _changed_units(old_src: str, new_src: str):
+    """Functions (at any depth, by qualname) and module- or class-level
+    statements whose text differs between the two versions of a test module,
+    from both sides. None when either side does not parse."""
+    import ast
+
+    def units(src):
+        tree = ast.parse(src)
+        out: dict = {}
+
+        def walk(body, prefix):
+            for i, n in enumerate(body):
+                if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    out[prefix + n.name] = n
+                    walk(n.body, prefix + n.name + ".")
+                elif isinstance(n, ast.ClassDef):
+                    walk(n.body, prefix + n.name + ".")
+                else:
+                    out[f"{prefix}#{ast.dump(n)}"] = n
+        walk(tree.body, "")
+        return tree, out
+
+    try:
+        ot, ou = units(old_src)
+        nt, nu = units(new_src)
+    except (SyntaxError, ValueError, RecursionError):
+        return None
+    changed = []
+    for k in set(ou) | set(nu):
+        a, b = ou.get(k), nu.get(k)
+        if a is None or b is None or ast.dump(a) != ast.dump(b):
+            changed += [x for x in (a, b) if x is not None]
+    return ot, nt, changed
+
+
+def leak_tests(rel: str, old_src, new_src) -> set | None:
+    """A test-module edit that writes state outside the test (BigQuery.X = ...
+    in a finally block, Parser.FUNCTIONS.pop(...), setattr(...)) can leave it
+    changed for every later test in the same process, which a test run on its
+    own never shows. The tests that read that state (they must, to see it),
+    kept unverified; everything when the state cannot be traced to readers;
+    None when the edited code writes nothing outside itself."""
+    import ast
+
+    if old_src is None or new_src is None:
+        return None
+    r = _changed_units(old_src, new_src)
+    if r is None:
+        return None
+    ot, nt, changed = r
+    names = {**_module_names(ot), **_module_names(nt)}
+    for u in changed:  # imports inside the edited code bind the same shared objects
+        for x in ast.walk(u):
+            if isinstance(x, ast.Import):
+                for a in x.names:
+                    names.setdefault(a.asname or a.name.split(".")[0], (a.name if a.asname else a.name.split(".")[0], None))
+            elif isinstance(x, ast.ImportFrom) and x.module and not x.level:
+                for a in x.names:
+                    names.setdefault(a.asname or a.name, (x.module, a.name))
+    writes: set = set()
+    for u in changed:
+        writes |= _state_writes(u, names)
+    if not writes:
+        return None
+    out: set = set()
+    pristine = None
+    for root, attrs in sorted(writes):
+        if root == "<any>":
+            for x in LK_BY_ATTR.get(attrs[0], ()):
+                out.update(SETS[LK[f"{x}|{attrs[0]}"]])
+            continue
+        if root in ("cls", "<global>") or names.get(root) is None:
+            out |= set(BY_FILE.get(rel, []))  # the test module's own state
+            for imp in TEST_IMPORTERS.get(rel, []):
+                out |= set(BY_FILE.get(imp, []))
+            continue
+        mod, name = names[root]
+        if not mod.startswith("sqlglot"):
+            return set(ALL)  # state of another library (unittest, os.environ, ...)
+        if name is None:  # a module: root.attrs[0] is one of its globals
+            if not attrs:
+                return set(ALL)
+            out |= global_ref_tests(mod, attrs[0])
+            if len(attrs) == 1:
+                continue  # the global itself: its readers are the lines naming it
+            cls_name, rest = attrs[0], attrs[1:]
+        else:
+            cls_name, rest = name, attrs
+        if pristine is None:
+            pristine = pristine_snapshot()
+            sub_of = class_subtree(pristine, pristine)
+        keys = [k for k in pristine["classes"] if k.partition(":")[2] == cls_name]
+        while not keys and rest:  # a module reached by attribute (exp.Foo, sqlglot.dialects.X)
+            cls_name, rest = rest[0], rest[1:]
+            keys = [k for k in pristine["classes"] if k.partition(":")[2] == cls_name]
+        if not keys:
+            return set(ALL)
+        if not rest:
+            for k in keys:
+                m_, _, q_ = k.partition(":")
+                out |= global_ref_tests(m_, q_)
+            continue
+        attr = rest[0]
+        hit = False
+        for k in keys:
+            for x in sub_of(k):
+                sid = LK.get(f"{x}|{attr}")
+                if sid is not None:
+                    out.update(SETS[sid])
+                    hit = True
+        if not hit:
+            return set(ALL)  # a method or descriptor the trace does not record
+    return out
+
+
 def test_change(plan: Plan, rel: str, ch: astdiff.PyChange, old_src=None) -> None:
     if rel.endswith("__init__.py"):
         d = os.path.dirname(rel) + "/"
@@ -1290,6 +1621,11 @@ def test_change(plan: Plan, rel: str, ch: astdiff.PyChange, old_src=None) -> Non
         for q, first, last in ch.def_changes:
             plan.cands.add(func_span_tests(rel, first, last), P_TEST)
     plan.cands.add(reg_tests(rel, ch), 1.0)  # kept unverified
+    if not ch.syntax_error and (ch.import_time or ch.runtime_lines or ch.def_changes):
+        lt = leak_tests(rel, old_src, plan.files.get(rel))
+        if lt is not None:
+            plan.cands.add(lt, 1.0)  # a leak shows only after the edited test: kept unverified
+            plan.notes.append(f"state written by edited test code in {rel}: {len(lt)} readers")
 
 
 def _has_call(nodes) -> bool:
