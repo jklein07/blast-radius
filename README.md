@@ -317,7 +317,10 @@ test that reads that state is charged, and those tests are never verified,
 because a test run on its own cannot show the leak. Such writes are
 assignments, deletes, mutating calls (`.pop()`, `.update()`, ...),
 `setattr` and `delattr` through a module-level or imported name. Readers of
-a class attribute come from the lookup trace, readers of a module global
+a class attribute come from the lookup trace (through a class a class holds,
+as in `Snowflake.Generator.TRANSFORMS`, where `Generator` is bound to
+`SnowflakeGenerator`: the snapshot's fingerprint of a class value names the
+class), readers of a module global
 from the lines naming it, and a test module's own state is charged as that
 file and its importers. Anything the trace cannot follow (another library's
 state, a method replaced by assignment) charges every test. A call of a

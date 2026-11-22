@@ -1518,6 +1518,32 @@ def _changed_units(old_src: str, new_src: str):
     return ot, nt, changed
 
 
+_CLS_BY_FP: dict | None = None
+
+
+def _class_attr_classes(pristine: dict, key: str, name: str) -> list:
+    """The pristine classes that class key holds as attribute name, looked up
+    through its MRO: a nested class, or one bound by assignment (Generator =
+    SnowflakeGenerator), whose value fingerprint is that of the class itself."""
+    global _CLS_BY_FP
+    classes = pristine["classes"]
+    if _CLS_BY_FP is None:
+        import hashlib
+
+        _CLS_BY_FP = {}
+        for k in classes:
+            m, _, q = k.partition(":")
+            h = hashlib.blake2b(f"C:{m}.{q}".encode("utf-8", "surrogatepass"), digest_size=8).hexdigest()
+            _CLS_BY_FP.setdefault(h, []).append(k)
+    for k in [key] + list(pristine.get("bases", {}).get(key, [])):
+        if f"{k}.{name}" in classes:
+            return [f"{k}.{name}"]
+        v = classes.get(k, {}).get(name)
+        if v is not None:
+            return list(_CLS_BY_FP.get(v, [])) if isinstance(v, str) else []
+    return []
+
+
 def leak_tests(rel: str, old_src, new_src) -> set | None:
     """A test-module edit that writes state outside the test (BigQuery.X = ...
     in a finally block, Parser.FUNCTIONS.pop(...), setattr(...)) can leave it
@@ -1585,6 +1611,11 @@ def leak_tests(rel: str, old_src, new_src) -> set | None:
                 m_, _, q_ = k.partition(":")
                 out |= global_ref_tests(m_, q_)
             continue
+        while len(rest) > 1:  # through a class held by a class (Snowflake.Generator.TRANSFORMS)
+            nk = [c for k in keys for c in _class_attr_classes(pristine, k, rest[0])]
+            if not nk:
+                break
+            keys, rest = sorted(set(nk)), rest[1:]
         attr = rest[0]
         hit = False
         for k in keys:
