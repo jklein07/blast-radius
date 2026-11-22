@@ -125,8 +125,14 @@ them across workers.
    leftover abstract methods change (an abstract `Schema` method now shadows
    `MappingSchema`'s inherited implementation, so it can no longer be
    instantiated), every test that ran the `__init__` it reached, or refers
-   to the class, is charged too. Each changed global maps to the tests that
-   execute a line referring to it.
+   to the class, is charged too. An ancestor that comes or goes changes
+   `isinstance()` checks and `except` clauses on the class's objects, so the
+   tests that ran a line naming it are charged as well. For an ancestor from
+   outside sqlglot (`ParseError(SqlglotError)` → `ParseError(ValueError)`),
+   every test that used the class is charged. All of this is limited to the
+   tests that used the class or a subclass: its readers, the tests that ran a
+   line naming it, and those that ran one of its own methods. Each changed
+   global maps to the tests that execute a line referring to it.
    One registry gets a closer look: a new expression class adds a key to
    `exp.EXPR_CLASSES`, which every test that builds a generator reads (in
    `_build_dispatch`). When the only change to it is new keys for new

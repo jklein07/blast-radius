@@ -2374,7 +2374,9 @@ def mro_moved_tests(key: str, sub, pristine: dict, patched: dict) -> set:
     matters on an object of this class family, so all of it is limited to
     the tests that used the family: its readers, the tests that ran a line
     naming one of its classes (every construction by name), and those that
-    ran one of its own methods."""
+    ran one of its own methods. An ancestor that comes or goes changes
+    isinstance() and except clauses: the tests that ran a line naming it, and
+    for one from outside sqlglot every test that used the family."""
     pc, nc = pristine["classes"], patched["classes"]
     if key not in pc or key not in nc:
         return set()
@@ -2397,6 +2399,17 @@ def mro_moved_tests(key: str, sub, pristine: dict, patched: dict) -> set:
             nxt_n = cn[j + 1] if j is not None and j + 1 < len(cn) else None
             if (i == 0 and j != 0) or nxt_o != nxt_n:
                 out |= _def_tests(k, a)
+    # an ancestor that came or went changes isinstance() and except clauses
+    # on the class's objects: the tests that ran a line naming it, or (a class
+    # from outside sqlglot, say ValueError, whose mentions are not mapped)
+    # every test that used the family
+    foreign = False
+    for k in set(mo) ^ set(mn):
+        mod, _, qual = k.partition(":")
+        if mod.startswith("sqlglot") and "." not in qual:
+            out |= global_ref_tests(mod, qual)
+        else:
+            foreign = True
     if pc[key].get("__abstractmethods__") != nc[key].get("__abstractmethods__"):
         for a in ("__init__", "__new__"):
             co = [k for k in mo if a in pc.get(k, ())]
@@ -2404,7 +2417,7 @@ def mro_moved_tests(key: str, sub, pristine: dict, patched: dict) -> set:
                 out |= _def_tests(co[0], a)
         mod, _, qual = key.partition(":")
         out |= global_ref_tests(mod, qual.split(".")[0])
-    if not out:
+    if not out and not foreign:
         return out
     used: set = set()
     for x in sub:
@@ -2422,7 +2435,7 @@ def mro_moved_tests(key: str, sub, pristine: dict, patched: dict) -> set:
             if x in pc:  # pristine classes only: a patched class's members vary by commit
                 _USED_BY[x] = u
         used |= u
-    return out & used
+    return used if foreign else out & used
 
 
 def fresh_member(key: str, attr: str, plan: Plan, pristine: dict) -> bool:
