@@ -266,9 +266,14 @@ test module while collecting, in every worker, so shared state can break
 tests in any file. Imports, plain definitions,
 test classes, skip and `mock.patch` decorators and call-free constants are
 known not to. A test module that changes only inside its test classes, and
-there only in plain methods (added, removed or edited, with no decorators and
-no calls in defaults or annotations), charges its own tests plus the test
-files that may use one of those classes or a subclass the module defines.
+there only in plain methods (added, removed or edited, with no decorators,
+constant defaults, and annotations that cannot fail when Python 3.13 runs the
+`def`; nothing the class body runs names a changed method), charges the tests
+of those classes and their subclasses in the module, plus the test files
+that may use one of those classes. When every changed method is a test
+(`test*`) that nothing else names, in the module or any other test file, only
+those tests are charged: removing `test_conditionless_join` from `TestParser`
+charges that test, not `test_max_nodes` and the other 79.
 Files that import only other names from it are left out: every dialect test
 file imports just `Validator` from `tests/dialects/test_dialect.py`, so a
 method added to `TestDialect` does not reach them.

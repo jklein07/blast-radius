@@ -1230,10 +1230,12 @@ def test_change(plan: Plan, rel: str, ch: astdiff.PyChange, old_src=None) -> Non
         d = os.path.dirname(rel) + "/"
         plan.cands.add([n for f, ns in BY_FILE.items() if f.startswith(d) for n in ns], P_TEST)
     if ch.syntax_error or ch.import_time:
-        plan.cands.add(BY_FILE.get(rel, []), P_TEST)
-        only = None
+        mem = None
         if not ch.syntax_error and old_src is not None and plan.files.get(rel):
-            only = _changed_test_classes(old_src, plan.files[rel])
+            mem = _test_member_changes(old_src, plan.files[rel])
+        own = _own_tests(rel, mem, old_src, plan) if mem is not None else None
+        plan.cands.add(BY_FILE.get(rel, []) if own is None else own, P_TEST)
+        only = mem[0] if mem is not None else None
         for imp in TEST_IMPORTERS.get(rel, []):
             if only is not None and not _may_use_classes(imp, rel, only, plan):
                 continue  # it imports other names from the module, never these classes
@@ -1255,13 +1257,43 @@ def _has_call(nodes) -> bool:
                for x in nodes if x is not None for n in ast.walk(x))
 
 
-def _changed_test_classes(old: str, new: str):
-    """The top-level classes of a test module (with the module's classes that
-    subclass them) when the two versions differ only inside those classes'
-    bodies, and there only in plain methods added, removed or changed (no
-    decorators, no call in a default or annotation, no other statement of the
-    body different or calling anything). Defining such a method does
-    nothing beyond the class and its subclasses. None otherwise."""
+_SAFE_ANN = {"int", "str", "bool", "float", "bytes", "complex", "object", "list", "dict", "set", "tuple", "type"}
+
+
+def _deftime_ok(v, lazy_ann: bool) -> bool:
+    """Whether running the def of plain method v cannot raise: Python 3.13
+    evaluates its defaults, and its annotations unless the module defers
+    them, when the class body runs. Constants only (and builtin type names
+    as annotations)."""
+    import ast
+
+    def const(e):
+        if isinstance(e, ast.UnaryOp) and isinstance(e.op, (ast.USub, ast.UAdd)):
+            e = e.operand
+        return isinstance(e, ast.Constant)
+
+    a = v.args
+    if not all(const(d) for d in a.defaults + [k for k in a.kw_defaults if k is not None]):
+        return False
+    if lazy_ann:
+        return True
+    ann = [v.returns] + [g.annotation for g in a.posonlyargs + a.args + a.kwonlyargs]
+    ann += [a.vararg.annotation if a.vararg else None, a.kwarg.annotation if a.kwarg else None]
+    return all(e is None or isinstance(e, ast.Constant) or (isinstance(e, ast.Name) and e.id in _SAFE_ANN) for e in ann)
+
+
+def _test_member_changes(old: str, new: str):
+    """(classes, names, all_named) when the two versions of a test module
+    differ only inside top-level classes' bodies, and there only in plain
+    methods added, removed or changed: no decorators; in the old version no
+    call in a default or annotation; in the new one a def that cannot raise
+    (_deftime_ok); no other statement of the body different or calling
+    anything, and nothing evaluated while the class body runs (its other
+    statements, every method's decorators, defaults and annotations) names a
+    changed method. Defining such a method does nothing beyond the class and
+    its subclasses. classes includes the module's classes built on the
+    changed ones; names are the changed method names; all_named is False when
+    a class differs only in the order of its methods. None otherwise."""
     import ast
 
     try:
@@ -1270,8 +1302,12 @@ def _changed_test_classes(old: str, new: str):
         return None
     if len(a.body) != len(b.body):
         return None
+    lazy = any(isinstance(s, ast.ImportFrom) and s.module == "__future__" and any(al.name == "annotations" for al in s.names)
+               for s in b.body)
     fn = (ast.FunctionDef, ast.AsyncFunctionDef)
     out: set = set()
+    names: set = set()
+    all_named = True
     for x, y in zip(a.body, b.body):
         if ast.dump(x) == ast.dump(y):
             continue
@@ -1289,19 +1325,34 @@ def _changed_test_classes(old: str, new: str):
         dx, dy = {v.name: v for v in mx}, {v.name: v for v in my}
         if len(dx) != len(mx) or len(dy) != len(my):
             return None  # a name defined twice
+        changed = set()
         for name in set(dx) | set(dy):
             p, q = dx.get(name), dy.get(name)
             if p is not None and q is not None and ast.dump(p) == ast.dump(q):
                 continue
+            changed.add(name)
             for v in (p, q):
-                if v is None:
-                    continue
-                if v.decorator_list:
+                if v is not None and v.decorator_list:
                     return None
-                ann = [v.returns] + [g.annotation for g in v.args.posonlyargs + v.args.args + v.args.kwonlyargs]
-                ann += [v.args.vararg.annotation if v.args.vararg else None, v.args.kwarg.annotation if v.args.kwarg else None]
-                if _has_call(v.args.defaults + [k for k in v.args.kw_defaults if k is not None] + ann):
+            if p is not None:
+                ann = [p.returns] + [g.annotation for g in p.args.posonlyargs + p.args.args + p.args.kwonlyargs]
+                ann += [p.args.vararg.annotation if p.args.vararg else None, p.args.kwarg.annotation if p.args.kwarg else None]
+                if _has_call(p.args.defaults + [k for k in p.args.kw_defaults if k is not None] + ann):
                     return None
+            if q is not None and not _deftime_ok(q, lazy):
+                return None
+        for tree, ms in ((x, mx), (y, my)):  # evaluated while the class body runs
+            ev = [v for v in tree.body if not isinstance(v, fn)]
+            for v in ms:
+                ev += v.decorator_list + v.args.defaults + [k for k in v.args.kw_defaults if k is not None]
+                if not lazy or tree is x:
+                    ev += [v.returns] + [g.annotation for g in v.args.posonlyargs + v.args.args + v.args.kwonlyargs]
+                    ev += [v.args.vararg.annotation if v.args.vararg else None, v.args.kwarg.annotation if v.args.kwarg else None]
+            if any(isinstance(n, ast.Name) and n.id in changed for e in ev if e is not None for n in ast.walk(e)):
+                return None
+        if not changed:
+            all_named = False
+        names |= changed
         out.add(x.name)
     if not out:
         return None
@@ -1321,6 +1372,85 @@ def _changed_test_classes(old: str, new: str):
             continue
         if pat.search(ast.unparse(v)):
             return None  # other module code uses one of them (an alias, a helper, a copy)
+    return out, names, all_named
+
+
+def _changed_test_classes(old: str, new: str):
+    """The classes of _test_member_changes, or None."""
+    r = _test_member_changes(old, new)
+    return None if r is None else r[0]
+
+
+_TEST_TEXTS = None
+
+
+def _named_in_other_tests(names: set, rel: str, plan) -> bool:
+    """Whether any Python file under tests/ but rel (pristine, or as the patch
+    leaves it) names one of names as a whole word other than in a `def` of
+    that name."""
+    import re
+
+    global _TEST_TEXTS
+    if _TEST_TEXTS is None:
+        _TEST_TEXTS = {}
+        root = os.path.join(PRISTINE, "tests")
+        for dp, dns, fns in os.walk(root):
+            dns[:] = [d for d in dns if d not in ("__pycache__",)]
+            for f in fns:
+                if f.endswith(".py"):
+                    r = os.path.relpath(os.path.join(dp, f), PRISTINE).replace(os.sep, "/")
+                    try:
+                        with open(os.path.join(dp, f), encoding="utf-8", errors="surrogateescape") as fh:
+                            _TEST_TEXTS[r] = fh.read()
+                    except OSError:
+                        _TEST_TEXTS[r] = None
+    pat = re.compile(r"(?<![A-Za-z0-9_])(" + "|".join(re.escape(n) for n in sorted(names)) + r")(?![A-Za-z0-9_])")
+    texts = dict(_TEST_TEXTS)
+    for f, t in plan.files.items():
+        if f.startswith("tests/") and f.endswith(".py"):
+            texts[f] = t
+    dpat = re.compile(r"\bdef\s+(" + "|".join(re.escape(n) for n in sorted(names)) + r")\s*\(")
+    for f, t in texts.items():
+        if f == rel:
+            continue
+        if t is None:
+            return True
+        if pat.search(t) and len(pat.findall(t)) != len(dpat.findall(t)):
+            return True  # a use, not just a method of the same name elsewhere
+    return False
+
+
+def _own_tests(rel: str, mem, old_src: str, plan):
+    """The tests of test module rel that a member-only change can reach (mem
+    from _test_member_changes): those of the changed classes and their
+    subclasses; and of these only the changed methods' own tests when every
+    changed name is a test method (test*) that nothing else names: in the
+    module, old or new, no use beyond its defs; in no other test file. None
+    to charge the whole file."""
+    import ast
+    import collections
+    import re
+
+    classes, names, all_named = mem
+    narrow = all_named and bool(names) and all(n.startswith("test") for n in names)
+    if narrow:
+        for src in (old_src, plan.files.get(rel)):
+            try:
+                tree = ast.parse(src)
+            except (SyntaxError, TypeError, ValueError):
+                return None
+            defs = collections.Counter(n.name for n in ast.walk(tree) if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)))
+            text = ast.unparse(tree)
+            for nm in names:
+                if len(re.findall(r"(?<![A-Za-z0-9_])" + re.escape(nm) + r"(?![A-Za-z0-9_])", text)) != defs.get(nm, 0):
+                    narrow = False
+        if narrow and _named_in_other_tests(names, rel, plan):
+            narrow = False
+    out = []
+    for n in BY_FILE.get(rel, []):
+        parts = TESTS_BY_NUM_ID[n].split("::")
+        if len(parts) != 3 or (parts[1] in classes and (not narrow or parts[2] in names)):
+            out.append(n)
     return out
 
 
