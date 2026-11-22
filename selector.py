@@ -933,6 +933,12 @@ def analyze(cid: str, text: str) -> Plan:
             # differ between our seed and pytest's
             plan.no_verify = True
             plan.notes.append(f"set/hash/id/random added in {new_rel}: no verification")
+        if (new is not None and (new_rel or "").startswith("sqlglot/") and new_rel.endswith(".py")
+                and not plan.no_verify and _runtime_state_added(old, new, fp)):
+            # a cache or other state that outlives a call: a test can fail only
+            # after another test ran, which a verification run need not repeat
+            plan.no_verify = True
+            plan.notes.append(f"runtime state added in {new_rel}: no verification")
         if old_rel and new_rel and old_rel != new_rel:
             plan.files[old_rel] = None
         if new_rel:
@@ -1053,6 +1059,56 @@ def _seed_nodes(src: str):
         inf = inf or isinstance(x, fn)
         stack.extend((c, inf) for c in ast.iter_child_nodes(x))
     return n, shapes
+
+
+_RT_PRE = None
+_CACHE_NAMES = {"lru_cache", "cache", "cached_property", "memoize", "cachedmethod"}
+
+
+def _runtime_state_added(old, new: str, fp) -> bool:
+    """Whether the patch adds state to sqlglot code that outlives a call: a
+    cache (lru_cache, cache, cached_property), a global or nonlocal rebinding,
+    or a write inside a function through a module-level name or cls (_SEEN[k]
+    = v, Parser.FUNCTIONS.pop(k), cls.X = v). Every test that calls the code is
+    already a candidate (without the cache each caller ran the body), but one
+    can fail only after another ran first, so they are kept unverified. A
+    quick check of the added lines (comments dropped) first; then the AST,
+    old against new (old is None for a new file)."""
+    import ast
+    import re
+    from collections import Counter
+
+    global _RT_PRE
+    if _RT_PRE is None:
+        _RT_PRE = re.compile(
+            r"cache|memo|registry|\b(?:global|nonlocal)\s"
+            r"|\b_?[A-Z][A-Z0-9_]{2,}(?:\[[^\]]*\])+\s*(?:=|\+=|\|=)(?!=)"
+            r"|\b_?[A-Z][A-Z0-9_]{2,}\.(?:append|extend|insert|pop|popitem|remove|clear|update|setdefault|add|discard)\("
+            r"|\b(?:cls|__class__)\.\w+(?:\[[^\]]*\])*\s*(?:=|\+=|\|=)(?!=)"
+            r"|\b(?:cls|__class__)\.\w+\.(?:append|extend|insert|pop|popitem|remove|clear|update|setdefault|add|discard)\(")
+    if not any(_RT_PRE.search(l.split("#", 1)[0]) for l in fp.added_text()):
+        return False
+
+    def facts(src):
+        tree = ast.parse(src)
+        names = _module_names(tree)
+        out: Counter = Counter()
+        for x in ast.walk(tree):
+            if (isinstance(x, ast.Name) and x.id in _CACHE_NAMES) or (isinstance(x, ast.Attribute) and x.attr in _CACHE_NAMES):
+                out[("cache", ast.dump(x))] += 1
+            elif isinstance(x, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                for g in ast.walk(x):
+                    if isinstance(g, (ast.Global, ast.Nonlocal)):
+                        out[("global", x.name, tuple(g.names))] += 1
+                for w in _state_writes(x, names):
+                    if w[0] != "<any>":
+                        out[("write", x.name, w)] += 1
+        return out
+
+    try:
+        return bool(facts(new) - (facts(old) if old is not None else Counter()))
+    except (SyntaxError, ValueError, RecursionError):
+        return False
 
 
 def _seed_order_added(old: str, new: str, fp) -> bool:

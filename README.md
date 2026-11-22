@@ -241,7 +241,14 @@ them across workers.
    including set methods (`.union()`, `.difference()`, ...) and set
    operators on `keys()`/`items()` views, but not the right side of an `in`
    test, where only membership matters. A new file is checked the same way.
-   None of the m1, sample or edge commits changes under this. Every
+   None of the m1, sample or edge commits changes under this. Candidates
+   also stay unverified when the patch adds state to sqlglot code that
+   outlives a call: a cache (`lru_cache`, `cache`, `cached_property`), a
+   `global` or `nonlocal` rebinding, or a write inside a function through a
+   module-level name or `cls`. Every test that calls such code is a candidate
+   already (without the cache each caller ran the body), but a test can then
+   fail only after another one ran, which a verification run need not
+   repeat. No m1, sample or edge commit does this. Every
    verified test runs under its own timer (three times its measured cost plus a
    margin; 15 s for class setup); a test that runs out of time is kept,
    because a patch that makes a test hang makes it fail. A test stops at
