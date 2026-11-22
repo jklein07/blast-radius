@@ -2376,13 +2376,15 @@ def mro_moved_tests(key: str, sub, pristine: dict, patched: dict) -> set:
     naming one of its classes (every construction by name), and those that
     ran one of its own methods. An ancestor that comes or goes changes
     isinstance() and except clauses: the tests that ran a line naming it, and
-    for one from outside sqlglot every test that used the family."""
+    for one from outside sqlglot or new in the patch every test that used the
+    family, as for a name the class newly reaches through its new MRO."""
     pc, nc = pristine["classes"], patched["classes"]
     if key not in pc or key not in nc:
         return set()
     mo = [key] + pristine["bases"].get(key, [])
     mn = [key] + patched["bases"].get(key, [])
     out: set = set()
+    foreign = False
     names: set = set()
     for k in mo:
         names |= set(pc.get(k, ()))
@@ -2392,6 +2394,12 @@ def mro_moved_tests(key: str, sub, pristine: dict, patched: dict) -> set:
         co = [k for k in mo if a in pc.get(k, ())]
         cn = [k for k in mn if a in nc.get(k, ())]
         if co == cn:
+            continue
+        if not co:
+            # a name the class newly reaches (its pristine lookup fell through
+            # to object or failed): __eq__ from a new mixin sets __hash__ to
+            # None, __len__ changes truthiness. Every use of the class can see it
+            foreign = True
             continue
         for i, k in enumerate(co):
             nxt_o = co[i + 1] if i + 1 < len(co) else None
@@ -2403,13 +2411,12 @@ def mro_moved_tests(key: str, sub, pristine: dict, patched: dict) -> set:
     # on the class's objects: the tests that ran a line naming it, or (a class
     # from outside sqlglot, say ValueError, whose mentions are not mapped)
     # every test that used the family
-    foreign = False
     for k in set(mo) ^ set(mn):
         mod, _, qual = k.partition(":")
-        if mod.startswith("sqlglot") and "." not in qual:
+        if mod.startswith("sqlglot") and "." not in qual and k in pc:
             out |= global_ref_tests(mod, qual)
         else:
-            foreign = True
+            foreign = True  # from outside sqlglot, nested, or new in the patch (no pristine references)
     if pc[key].get("__abstractmethods__") != nc[key].get("__abstractmethods__"):
         for a in ("__init__", "__new__"):
             co = [k for k in mo if a in pc.get(k, ())]

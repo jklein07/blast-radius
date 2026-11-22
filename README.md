@@ -127,9 +127,13 @@ them across workers.
    instantiated), every test that ran the `__init__` it reached, or refers
    to the class, is charged too. An ancestor that comes or goes changes
    `isinstance()` checks and `except` clauses on the class's objects, so the
-   tests that ran a line naming it are charged as well. For an ancestor from
-   outside sqlglot (`ParseError(SqlglotError)` → `ParseError(ValueError)`),
-   every test that used the class is charged. All of this is limited to the
+   tests that ran a line naming it are charged as well. Every test that used
+   the class is charged in three cases. One is an ancestor from outside
+   sqlglot (`ParseError(SqlglotError)` → `ParseError(ValueError)`). Another
+   is an ancestor the patch itself adds, which has no pristine references.
+   The third is a name the class now reaches that its old MRO did not define:
+   a new mixin's `__eq__` makes instances unhashable, and its `__len__`
+   changes their truthiness. All of this is limited to the
    tests that used the class or a subclass: its readers, the tests that ran a
    line naming it, and those that ran one of its own methods. Each changed
    global maps to the tests that execute a line referring to it.
