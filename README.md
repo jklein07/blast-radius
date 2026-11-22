@@ -71,8 +71,9 @@ them across workers.
      or dataclass on such classes), and what class creation derives from them
      is fingerprinted on its own, so on a class whose whole MRO is sqlglot
      code (no Enum, dataclass, NamedTuple, TypedDict or Protocol) that entry
-     charges nothing. The attribute's own value is a changed attribute like
-     any other.
+     charges nothing (nor does it keep the TPC tests from being judged by
+     front-end fingerprints). The attribute's own value is a changed
+     attribute like any other.
    - *New modules nothing imports.* Python imports a module only by its name,
      and every dynamic import in sqlglot and its tests builds that name from
      text found somewhere (a dialect string, an attribute name, a fixed

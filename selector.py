@@ -2610,6 +2610,8 @@ def fe_import_ok(n: int, d: dict, plan, pristine=None, patched=None) -> bool:
     for key, attr in d["attrs"]:
         if attr == "__doc__":
             continue
+        if attr == "__annotations__" and pristine is not None and _plain_class(key, pristine) is not None:
+            continue  # class annotations: read by nothing at run time (snapshot_candidates)
         if attr == "*" or attr.startswith("__"):
             return False
         mod, _, qual = key.partition(":")
