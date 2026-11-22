@@ -1231,7 +1231,12 @@ def test_change(plan: Plan, rel: str, ch: astdiff.PyChange, old_src=None) -> Non
         plan.cands.add([n for f, ns in BY_FILE.items() if f.startswith(d) for n in ns], P_TEST)
     if ch.syntax_error or ch.import_time:
         plan.cands.add(BY_FILE.get(rel, []), P_TEST)
+        only = None
+        if not ch.syntax_error and old_src is not None and plan.files.get(rel):
+            only = _changed_test_classes(old_src, plan.files[rel])
         for imp in TEST_IMPORTERS.get(rel, []):
+            if only is not None and not _may_use_classes(imp, rel, only, plan):
+                continue  # it imports other names from the module, never these classes
             plan.cands.add(BY_FILE.get(imp, []), P_TEST)
         if rel not in BY_FILE and not TEST_IMPORTERS.get(rel):
             # a helper module no test file is known to import: be safe
@@ -1241,6 +1246,115 @@ def test_change(plan: Plan, rel: str, ch: astdiff.PyChange, old_src=None) -> Non
         for q, first, last in ch.def_changes:
             plan.cands.add(func_span_tests(rel, first, last), P_TEST)
     plan.cands.add(reg_tests(rel, ch), 1.0)  # kept unverified
+
+
+def _has_call(nodes) -> bool:
+    import ast
+
+    return any(isinstance(n, (ast.Call, ast.Await, ast.Yield, ast.YieldFrom, ast.NamedExpr, ast.Lambda))
+               for x in nodes if x is not None for n in ast.walk(x))
+
+
+def _changed_test_classes(old: str, new: str):
+    """The top-level classes of a test module (with the module's classes that
+    subclass them) when the two versions differ only inside those classes'
+    bodies, and there only in plain methods added, removed or changed (no
+    decorators, no call in a default or annotation, no other statement of the
+    body different or calling anything). Defining such a method does
+    nothing beyond the class and its subclasses. None otherwise."""
+    import ast
+
+    try:
+        a, b = ast.parse(old), ast.parse(new)
+    except SyntaxError:
+        return None
+    if len(a.body) != len(b.body):
+        return None
+    fn = (ast.FunctionDef, ast.AsyncFunctionDef)
+    out: set = set()
+    for x, y in zip(a.body, b.body):
+        if ast.dump(x) == ast.dump(y):
+            continue
+        if not (isinstance(x, ast.ClassDef) and isinstance(y, ast.ClassDef) and x.name == y.name):
+            return None
+        for f in ("decorator_list", "bases", "keywords", "type_params"):
+            if [ast.dump(v) for v in getattr(x, f, []) or []] != [ast.dump(v) for v in getattr(y, f, []) or []]:
+                return None
+        rx = [ast.dump(v) for v in x.body if not isinstance(v, fn)]
+        ry = [ast.dump(v) for v in y.body if not isinstance(v, fn)]
+        if rx != ry or _has_call([v for v in y.body if not isinstance(v, fn)]):
+            return None
+        mx = [v for v in x.body if isinstance(v, fn)]
+        my = [v for v in y.body if isinstance(v, fn)]
+        dx, dy = {v.name: v for v in mx}, {v.name: v for v in my}
+        if len(dx) != len(mx) or len(dy) != len(my):
+            return None  # a name defined twice
+        for name in set(dx) | set(dy):
+            p, q = dx.get(name), dy.get(name)
+            if p is not None and q is not None and ast.dump(p) == ast.dump(q):
+                continue
+            for v in (p, q):
+                if v is None:
+                    continue
+                if v.decorator_list:
+                    return None
+                ann = [v.returns] + [g.annotation for g in v.args.posonlyargs + v.args.args + v.args.kwonlyargs]
+                ann += [v.args.vararg.annotation if v.args.vararg else None, v.args.kwarg.annotation if v.args.kwarg else None]
+                if _has_call(v.args.defaults + [k for k in v.args.kw_defaults if k is not None] + ann):
+                    return None
+        out.add(x.name)
+    if not out:
+        return None
+    grew = True
+    while grew:  # and the module's own classes built on them
+        grew = False
+        for v in b.body:
+            if isinstance(v, ast.ClassDef) and v.name not in out and any(
+                    isinstance(n, ast.Name) and n.id in out for base in v.bases for n in ast.walk(base)):
+                out.add(v.name)
+                grew = True
+    return out
+
+
+def _may_use_classes(imp: str, rel: str, names: set, plan) -> bool:
+    """Whether test file imp may reach one of the classes `names` of test
+    module rel: unless it imports rel itself, only through `from rel import
+    ...` of other names (no star, no module object), and names none of them
+    anywhere in its text."""
+    import ast
+    import re
+
+    text = plan.files[imp] if imp in plan.files else read_pristine(imp)
+    if not text:
+        return True
+    for nm in names:
+        if re.search(r"(?<![A-Za-z0-9_])" + re.escape(nm) + r"(?![A-Za-z0-9_])", text):
+            return True
+    try:
+        tree = ast.parse(text)
+    except SyntaxError:
+        return True
+    mod = rel[:-3].replace("/", ".")
+    pkg = imp[:-3].replace("/", ".").rpartition(".")[0]
+    direct = False
+    for n in ast.walk(tree):
+        if isinstance(n, ast.Import):
+            for al in n.names:
+                if al.name == mod or mod.startswith(al.name + "."):
+                    return True  # the module (or a package above it) as an object
+        elif isinstance(n, ast.ImportFrom):
+            base = n.module or ""
+            if n.level:
+                parts = pkg.split(".")
+                up = parts[: len(parts) - (n.level - 1)] if n.level > 1 else parts
+                base = ".".join(up + ([n.module] if n.module else []))
+            if base == mod:
+                direct = True
+                if any(al.name == "*" or al.name in names for al in n.names):
+                    return True
+            elif mod.startswith(base + ".") and any(al.name == "*" or mod == base + "." + al.name for al in n.names):
+                return True  # the module object through its package
+    return not direct  # reached only through another module: assume it may
 
 
 # ---------------------------------------------------- snapshot-diff candidates
