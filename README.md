@@ -124,6 +124,14 @@ them across workers.
    classes, so they matter only for nodes of those classes, and a test can
    only get such a node through another changed lookup (the parser's
    `FUNCTIONS`, `FUNCTION_BY_NAME`, the new names), each charged on its own.
+   The same holds when the only change is lost keys of expression classes
+   that are gone (a reverted or deleted node type): only nodes of those
+   classes used their entries, and a test gets one only through the class,
+   its name or a changed lookup, each charged on its own. That needs every
+   class left to keep its key, and none of them to hold a gone class's key
+   (it would take over the entry). Either way the patch may change
+   `generator.py` elsewhere, as long as `_build_dispatch` keeps its pinned
+   source and the patched files name `EXPR_CLASSES` nowhere else.
    Tokenizer settings get a closer look too. A `Tokenizer` hands every
    setting to a fresh `TokenizerCore` each time one is built, so the trace
    shows every tokenizing test of a dialect family reading every setting.

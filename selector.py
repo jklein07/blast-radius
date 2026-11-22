@@ -1449,7 +1449,8 @@ def snapshot_candidates(pristine: dict, patched: dict, diff: dict, plan: Plan) -
             continue
         if dd and mod in sys.modules and default_only_value(vars(sys.modules[mod]).get(name), dd):
             continue  # a function (or a name bound to it) whose defaults alone changed: as above
-        if mod == "sqlglot.expressions" and name == "EXPR_CLASSES" and expr_registry_grew(pristine, diff, plan):
+        if mod == "sqlglot.expressions" and name == "EXPR_CLASSES" and (
+                expr_registry_grew(pristine, diff, plan) or expr_registry_shrank(pristine, diff, plan)):
             sid = MODATTR.get(f"{mod}|__dict__")
             if sid is not None:
                 out.update(SETS[sid])
@@ -1542,16 +1543,14 @@ def _mention_sites(word: str) -> list:
     return out
 
 
-def expr_registry_grew(pristine: dict, diff: dict, plan: Plan) -> bool:
-    """Whether the change to sqlglot.expressions.EXPR_CLASSES (expression key
-    -> class) is only new keys of new classes, which no test can feel through
-    it. Its one reader is generator._build_dispatch; new keys only add
-    dispatch entries keyed by the new classes, consulted only to generate a
-    node of a new class. A test gets such a node only through another changed
-    lookup (the parser's FUNCTIONS, FUNCTION_BY_NAME, ALL_FUNCTIONS, the new
-    module names, changed code), each charged on its own. Old classes keep
-    their keys, and none is displaced by a new class with the same key."""
-    if "sqlglot/generator.py" in plan.files or "sqlglot/expressions/__init__.py" in plan.files:
+def _registry_readers_ok(plan: Plan, diff: dict) -> bool:
+    """EXPR_CLASSES is still built as at the pinned commit and read only by
+    generator._build_dispatch, whose source is the pinned one: the registry
+    module is unchanged, no class's `key` changed, every pristine mention is
+    its definition or inside _build_dispatch, and the patch names it
+    nowhere else (a changed generator.py may name it only inside an
+    unchanged _build_dispatch)."""
+    if "sqlglot/expressions/__init__.py" in plan.files:
         return False
     if any(a == "key" for _, a in diff["attrs"]):
         return False
@@ -1564,7 +1563,49 @@ def expr_registry_grew(pristine: dict, diff: dict, plan: Plan) -> bool:
         if rel == "sqlglot/expressions/__init__.py" and text.startswith(b"EXPR_CLASSES"):
             continue
         return False
-    if any(t and "EXPR_CLASSES" in t for t in plan.files.values()):
+    for rel, t in plan.files.items():
+        if not t or "EXPR_CLASSES" not in t:
+            continue
+        if rel != "sqlglot/generator.py":
+            return False
+    gen = plan.files.get("sqlglot/generator.py", "")
+    if gen is None:
+        return False
+    if gen:
+        import ast
+        import re
+
+        def seg(src):
+            try:
+                tree = ast.parse(src)
+            except SyntaxError:
+                return None
+            for n in tree.body:
+                if isinstance(n, ast.FunctionDef) and n.name == "_build_dispatch":
+                    a = min([d.lineno for d in n.decorator_list] + [n.lineno])
+                    return "\n".join(src.splitlines()[a - 1:n.end_lineno]), a, n.end_lineno
+            return None
+
+        old, new = seg(read_pristine("sqlglot/generator.py") or ""), seg(gen)
+        if old is None or new is None or old[0] != new[0]:
+            return False
+        pat = re.compile(r"(?<![A-Za-z0-9_])EXPR_CLASSES(?![A-Za-z0-9_])")
+        for i, line in enumerate(gen.splitlines(), 1):
+            if pat.search(line) and not new[1] <= i <= new[2]:
+                return False
+    return True
+
+
+def expr_registry_grew(pristine: dict, diff: dict, plan: Plan) -> bool:
+    """Whether the change to sqlglot.expressions.EXPR_CLASSES (expression key
+    -> class) is only new keys of new classes, which no test can feel through
+    it. Its one reader is generator._build_dispatch; new keys only add
+    dispatch entries keyed by the new classes, consulted only to generate a
+    node of a new class. A test gets such a node only through another changed
+    lookup (the parser's FUNCTIONS, FUNCTION_BY_NAME, ALL_FUNCTIONS, the new
+    module names, changed code), each charged on its own. Old classes keep
+    their keys, and none is displaced by a new class with the same key."""
+    if not _registry_readers_ok(plan, diff):
         return False
     try:
         from sqlglot import exp
@@ -1595,6 +1636,53 @@ def expr_registry_grew(pristine: dict, diff: dict, plan: Plan) -> bool:
         for fk in pcl:
             if fk.startswith("sqlglot.expressions") and fk not in _LIVE:
                 return False  # a class is gone: its key may be too
+    except Exception:  # noqa: BLE001
+        return False
+    return True
+
+
+def expr_registry_shrank(pristine: dict, diff: dict, plan: Plan) -> bool:
+    """Whether the change to sqlglot.expressions.EXPR_CLASSES is only the loss
+    of the keys of expression classes that are gone (a reverted or deleted
+    node type). Its one reader, generator._build_dispatch, then loses only
+    the entries keyed by those classes, consulted only to generate a node of
+    a gone class. A test gets such a node only through the class or its name
+    (charged by the class's own entry and the module globals that bound it)
+    or through another changed lookup (the parser's tables, changed code),
+    each charged on its own. Every class left keeps its key (no `key`
+    attribute changed), and none of them has the key of a gone class: with
+    the gone class no longer last in the comprehension, it would take over
+    that entry."""
+    if not _registry_readers_ok(plan, diff):
+        return False
+    try:
+        from sqlglot import exp
+        import fingerprint
+    except Exception:  # noqa: BLE001
+        return False
+    if not _LIVE:
+        _LIVE.update(dict(fingerprint.iter_classes(sorted(sys.modules), "sqlglot")))
+    pcl = pristine.get("classes") or {}
+    rev = {id(v): k for k, v in _LIVE.items()}
+    reg = getattr(exp, "EXPR_CLASSES", None)
+    if not isinstance(reg, dict):
+        return False
+    for k, c in reg.items():
+        fk = rev.get(id(c))
+        if fk is None or fk not in pcl:
+            return False  # a new class (or one that moved): not only a loss
+    gone = [fk for fk in pcl if fk.startswith("sqlglot.expressions") and fk not in _LIVE]
+    if not gone:
+        return False
+    gone_keys = set()
+    for fk in gone:
+        gk = (pcl.get(fk) or {}).get("key")
+        if gk is None:
+            return False
+        gone_keys.add(gk)
+    try:
+        if any(fingerprint.fp(k) in gone_keys for k in reg):
+            return False  # a class left now holds a gone class's key
     except Exception:  # noqa: BLE001
         return False
     return True
