@@ -211,7 +211,9 @@ them across workers.
    chosen: 0.2 for code and import-time state, 0.5 for test-side changes,
    0.9 for data files). A child runs with one hash seed and pytest with
    others, so a patch that takes a `sorted(` or `.sort(` out of sqlglot code
-   (output may then follow set order) keeps its candidates unverified. Every
+   (output may then follow set order), or adds a set (a display, a
+   comprehension, `set(` or `frozenset(`), a `hash(` or `id(` call or a use of
+   `random` to sqlglot or test code, keeps its candidates unverified. Every
    verified test runs under its own timer (three times its measured cost plus a
    margin; 15 s for class setup); a test that runs out of time is kept,
    because a patch that makes a test hang makes it fail. A test stops at

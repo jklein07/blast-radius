@@ -927,6 +927,12 @@ def analyze(cid: str, text: str) -> Plan:
             # decides: a child verifies under one seed, pytest under others
             plan.no_verify = True
             plan.notes.append(f"sort removed in {new_rel}: no verification")
+        if (old is not None and new is not None and (new_rel or "").startswith(("sqlglot/", "tests/")) and new_rel.endswith(".py")
+                and not plan.no_verify and _seed_order_added(old, new, fp)):
+            # a new set (or hash(), id(), random): its order or value may
+            # differ between our seed and pytest's
+            plan.no_verify = True
+            plan.notes.append(f"set/hash/id/random added in {new_rel}: no verification")
         if old_rel and new_rel and old_rel != new_rel:
             plan.files[old_rel] = None
         if new_rel:
@@ -999,6 +1005,42 @@ def test_side(rel: str, is_new: bool) -> bool:
     b = os.path.basename(rel)
     return (is_new or rel in BY_FILE or bool(TEST_IMPORTERS.get(rel)) or b == "__init__.py"
             or b.startswith("test_") or b.endswith("_test.py"))
+
+
+_SEED_PRE = None
+
+
+def _seed_nodes(src: str):
+    import ast
+
+    n = 0
+    for x in ast.walk(ast.parse(src)):
+        if isinstance(x, (ast.Set, ast.SetComp)):
+            n += 1
+        elif isinstance(x, ast.Call) and isinstance(x.func, ast.Name) and x.func.id in ("set", "frozenset", "hash", "id"):
+            n += 1
+        elif isinstance(x, ast.Attribute) and isinstance(x.value, ast.Name) and x.value.id == "random":
+            n += 1
+    return n
+
+
+def _seed_order_added(old: str, new: str, fp) -> bool:
+    """Whether the patch adds a set (display, comprehension, set() or
+    frozenset()), a hash() or id() call, or a use of random: iteration order
+    of a set of strings, and hash() itself, follow PYTHONHASHSEED, so a child
+    that verifies under seed 0 could pass a test that pytest fails. A quick
+    text check of the added lines first; then node counts, old against new."""
+    import re
+
+    global _SEED_PRE
+    if _SEED_PRE is None:
+        _SEED_PRE = re.compile(r"(?<![\w.])(?:set|frozenset|hash|id)\s*\(|\brandom\b|\{|\bcomprehension\b")
+    if not any(_SEED_PRE.search(l) for l in fp.added_text()):
+        return False
+    try:
+        return _seed_nodes(new) > _seed_nodes(old)
+    except (SyntaxError, ValueError, RecursionError):
+        return False
 
 
 def tests_reading(rel: str, listing: bool = False) -> set:
