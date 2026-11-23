@@ -4,6 +4,10 @@ Entry for the RWX Blast Radius track (Builders Buildathon, Nov 2026). For each
 patch against sqlglot `eb11aec`, it prints which tests to run and how to split
 them across workers.
 
+**Result:** team *fortnite pirate token* placed **2nd of 438 teams** in the final
+(318.2 s, scored on about 60 unseen commits; 1st was 298.3 s). The final entry is
+commit `58b806a`.
+
 ## How it decides
 
 1. **AST diff, not text diff.** `astdiff.py` walks the old and new syntax trees
